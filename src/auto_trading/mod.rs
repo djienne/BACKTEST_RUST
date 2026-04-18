@@ -1,5 +1,7 @@
 //! Generic backtesting framework and exchange adapters shared with the active binary.
 //! The repository's executable parameter sweep still lives in `src/main.rs`.
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 mod backtester;
 mod base;

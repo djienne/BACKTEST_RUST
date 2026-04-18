@@ -636,13 +636,13 @@ where
 
         let (start, next_start) = k_time_convert(k.time, level);
 
-        let start_k = (&array[i..])
+        let start_k = array[i..]
             .iter()
             .position(|v| v.time <= start)
             .map(|v| (i + v, array[i + v]))
             .unwrap_or((array.len() - 1, *array.last().unwrap()));
 
-        let next_start_k = (&array[..=i])
+        let next_start_k = array[..=i]
             .iter()
             .rev()
             .enumerate()
@@ -782,7 +782,7 @@ impl MACDCache {
         self.dea.push_front(dif);
         let dea = self
             .dea_ema
-            .ema(Source::new(&self.dea.as_slices().0), dea_length);
+            .ema(Source::new(self.dea.as_slices().0), dea_length);
         let macd = (dif - dea) * 2.0f32;
         (dif, dea, macd)
     }
