@@ -12,13 +12,13 @@ The codebase is split into small modules:
 The current default run is hardcoded to:
 
 - Pair: `BTC-USDT`
-- Timeframe: `4h`
-- Threads: `12`
+- Timeframe: `15m`
+- Threads: `1` (single-threaded for repeatable benchmarking)
 - EMA search space: fast `5..=600`, slow `6..=600`, with `slow > fast`
 - Starting capital: `1000 USDT`
 - Trading fee: `0.15%` on buys and sells
 - Execution model: signal from the previous close, execution at the next bar open
-- Precision: `f32` by default for the expensive sweep and EMA storage
+- Precision: `f32` by default for the expensive sweep and EMA storage (compile-time switch)
 
 ## Strategy summary
 
@@ -30,7 +30,7 @@ This is a simple spot-style EMA crossover backtest:
 - It executes trades at the next bar open and marks portfolio value at the bar close.
 - It evaluates every allowed EMA pair and keeps the best result by Sharpe ratio.
 
-The current data download starts at `2019-01-01T00:00:00Z`.
+The current data download defaults to starting at `2019-01-01T00:00:00Z`; this can be overridden at the command line via `--since` (see [Downloading historical data](#downloading-historical-data)).
 
 ## Prerequisites
 
@@ -40,44 +40,75 @@ The current data download starts at `2019-01-01T00:00:00Z`.
 
 ## Quick start
 
-Run the backtest with:
+Run the backtest with the default `f32` precision:
 
 ```bash
 cargo run --release
 ```
 
+Run it with `f64` precision instead (compile-time selection):
+
+```bash
+cargo run --release --no-default-features --features f64
+```
+
+The two features (`f32` and `f64`) are mutually exclusive; the build fails with a clear error if both are enabled or neither is.
+
 What happens during a normal run:
 
-- The binary looks for `dataKLines/BTC-USDT-4h.json`.
-- If the file is missing or older than 2 days, it tries to download fresh Binance candles.
+- The binary looks for `dataKLines/BTC-USDT-15m.json`.
+- Freshness is measured from the **last candle timestamp inside the file**, not the file's mtime. If that last candle is more than two days old (or the file is missing), Binance is queried for a fresh pull. Pass `--force` or set `BACKTEST_FORCE_DOWNLOAD=1` to skip this check.
 - If the download fails but the cache file already exists, it falls back to the cached file.
+- The cache is normalized on load: candles are sorted ascending by timestamp and any duplicate timestamps are dropped. If the file needed fixing, it is rewritten in place and a one-line note is printed to stderr.
 - It prints the candle date range, computes indicators, runs the EMA search, and reports the best result.
-- It appends the latest best-result row to `results/BTC-USDT-4h.csv`.
-  The CSV includes the selected precision and the measured sweep duration in milliseconds.
+- It appends the latest best-result row to `results/BTC-USDT-15m.csv`.
+  The CSV includes the active precision (`f32` or `f64`) and the measured sweep duration in milliseconds.
 
 Useful commands:
 
 ```bash
 cargo test
+cargo test --no-default-features --features f64
 ```
 
-Precision switching is available through environment variables:
+The optional `BACKTEST_SHOW_PROGRESS` env var (`0`/`1`) toggles the per-iteration progress log without rebuilding. `BACKTEST_FORCE_DOWNLOAD=1` is an env-level shortcut for `--force`.
+
+## Downloading historical data
+
+To pull fresh kline data **without running the sweep**, use the `download` subcommand:
 
 ```bash
-# Run the expensive sweep in f64 instead of f32.
-$env:BACKTEST_PRECISION = "f64"
-cargo run --release
+cargo run --release -- download
+```
 
-# Compare f32 and f64 on the same cached candle input.
-$env:BACKTEST_COMPARE_PRECISIONS = "1"
-$env:BACKTEST_SHOW_PROGRESS = "0"
-cargo run --release
+This always re-downloads (bypasses the freshness guard), writes `dataKLines/<pair>-<level>.json`, then exits.
+
+Override the start of the window with `--since`. Either a calendar date or a unix-milliseconds timestamp is accepted:
+
+```bash
+cargo run --release -- download --since 2017-08-17
+cargo run --release -- download --since 1502928000000
+```
+
+**Maximum available history for BTC-USDT.** Binance's BTC/USDT spot pair started trading on **2017-08-17**, so passing `--since 2017-08-17` (or anything earlier — the API clamps to its own earliest candle) yields the full history Binance will serve for that symbol. Other pairs may have later launch dates; Binance will simply return the earliest candles it has. Note: a full 15-minute history from 2017 is roughly 300k candles and a multi-megabyte JSON file, and the pagination loop adds a small inter-page delay, so an initial full pull takes on the order of a minute.
+
+Force a re-download inside the normal sweep run with `--force` (or `BACKTEST_FORCE_DOWNLOAD=1`):
+
+```bash
+cargo run --release -- --force
+BACKTEST_FORCE_DOWNLOAD=1 cargo run --release
+```
+
+Full CLI reference:
+
+```bash
+cargo run --release -- --help
 ```
 
 ## Files this program touches
 
-- `dataKLines/BTC-USDT-4h.json`: cached market data for the current default configuration.
-- `results/BTC-USDT-4h.csv`: appended run history for the current default configuration.
+- `dataKLines/BTC-USDT-15m.json`: cached market data for the current default configuration. Rewritten in place if the loader detects out-of-order or duplicate timestamps.
+- `results/BTC-USDT-15m.csv`: appended run history for the current default configuration.
 
 ## Configuration
 
@@ -86,30 +117,36 @@ The current binary is configured in source code rather than via CLI flags or a c
 Values you are most likely to change live in `src/main.rs`:
 
 - `default_run_config()`: pair, timeframe, Rayon thread count, EMA search range, starting capital, fee, and execution model
-- `BACKTEST_PRECISION`: optional env override for `f32` or `f64`
-- `BACKTEST_COMPARE_PRECISIONS`: optional env override to benchmark both precisions on the same backtest
-- `BACKTEST_SHOW_PROGRESS`: optional env override to suppress progress logging during comparisons
+- Precision is selected at compile time via the `f32` / `f64` cargo features (default: `f32`)
+- `BACKTEST_SHOW_PROGRESS`: optional env override to suppress progress logging
 
 ## Notes on numeric precision
 
-- The expensive EMA sweep is generic over `f32` and `f64`.
+- The expensive EMA sweep is generic over `f32` and `f64`, but each binary build monomorphizes only the active precision (no dead code, no runtime dispatch).
 - `f32` mode keeps the hot-loop data arrays and EMA storage in `f32`, which uses less memory.
 - `f64` mode widens the hot-loop data arrays and EMA storage to `f64`, which is useful when you want less cumulative rounding drift in the sweep.
-- The candle input values are the same between both runs; only the arithmetic/storage precision differs inside the expensive loop.
-- In comparison mode (`BACKTEST_COMPARE_PRECISIONS=1`) the f32 and f64 sweeps run in parallel via `rayon::join`, so the wall-clock time is roughly `max(f32, f64)` rather than `f32 + f64`.
+- The candle input values are the same between both builds; only the arithmetic/storage precision differs inside the expensive loop.
+- To compare precisions, build and run twice — once per feature — and compare the printed `Sweep duration` and best result.
 
-Sample comparison run on the cached `BTC-USDT 4h` data (2019-01-01 → 2024-05-16):
+## Optimization
 
-| Precision | Duration | Best periods | Final value | Sharpe | Max drawdown |
-| --- | ---: | --- | ---: | ---: | ---: |
-| `f32` | `2.081s` | `(36, 133)` | `36212.676` | `1.672353` | `40.9240%` |
-| `f64` | `2.074s` | `(36, 133)` | `36212.699` | `1.672332` | `40.9240%` |
+The release profile is tuned for maximum throughput:
 
-Quick comment:
+- `opt-level = 3`
+- `lto = "fat"` — whole-program inlining across crates
+- `codegen-units = 1` — single codegen unit for fewer optimization boundaries
+- `strip = true` — drop debug symbols from the release binary
+- `.cargo/config.toml` sets `rustflags = ["-C", "target-cpu=native"]` so the build uses the host CPU's full instruction set (e.g., AVX2/AVX-512 if present). Resulting binaries are not portable to older CPUs — rebuild on the target machine.
 
-- The winning EMA pair stayed the same across precisions.
-- Final-value difference was about `+0.024 USDT` for `f64`; Sharpe difference was `~2e-5`.
-- Both precisions ran concurrently here, so the per-precision durations sum to roughly the wall-clock time of the full run, not double it.
-- Treat these numbers as machine- and dataset-specific, not universal benchmark claims.
+Sample run on the cached `BTC-USDT 15m` data (2019-01-01 → 2024-05-09, ~187k candles), single-threaded, built with the optimization profile above:
+
+| Precision | Build command | Sweep duration | Best periods | Final value | Sharpe | Max drawdown |
+| --- | --- | ---: | --- | ---: | ---: | ---: |
+| `f32` | `cargo run --release` | `124.681s` | `(243, 249)` | `14829.247` | `1.296941` | `68.36%` |
+| `f64` | `cargo run --release --no-default-features --features f64` | `220.298s` | `(207, 290)` | `14516.753` | `1.290675` | `68.56%` |
+
+On this dataset f64 is roughly 1.77× slower than f32 — the sweep is dominated by memory bandwidth (the EMA store grows to ~hundreds of MB), so widening the data words doubles the working set and pushes more traffic through the cache hierarchy. The two precisions select different EMA pairs because the search space is huge and many pairs have very close Sharpe ratios; small rounding differences are enough to tip the ranking.
+
+Treat these numbers as machine- and dataset-specific, not universal benchmark claims.
 
 - `backtest_rust_f16.zip` is best treated as an archived experiment, not part of the current build or documented runtime path.

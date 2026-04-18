@@ -9,6 +9,11 @@ edition = "2021"
 name = "backtest_rust"
 path = "src/lib.rs"
 
+[features]
+default = ["f32"]
+f32 = []
+f64 = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -19,4 +24,7 @@ tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.11.18", features = ["json"] }
 
 [profile.release]
-opt-level = 3  # Full release optimizations.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

@@ -1,13 +1,28 @@
 //! Precision selection and float abstraction for the backtest sweep.
 //!
-//! `BacktestFloat` is a small in-house trait covering the f32/f64 ops the
-//! sweep needs. We deliberately don't depend on `num-traits::Float` to keep
-//! the dependency surface tight; switching is a one-line change if more
-//! numeric ops become necessary.
+//! The active precision is chosen at compile time via Cargo features:
+//! `f32` (default) or `f64`. Exactly one must be enabled. The `Float` type
+//! alias and `ACTIVE_PRECISION` constant resolve to the selected precision so
+//! the rest of the crate stays generic-free at the binary surface.
+//!
+//! `BacktestFloat` remains a small in-house trait covering the f32/f64 ops
+//! the sweep needs. We deliberately don't depend on `num-traits::Float` to
+//! keep the dependency surface tight.
 
 use std::fmt;
 use std::ops::{Add, Div, Mul, Sub};
-use std::str::FromStr;
+
+#[cfg(all(feature = "f32", feature = "f64"))]
+compile_error!("Cargo features `f32` and `f64` are mutually exclusive — pick exactly one");
+
+#[cfg(not(any(feature = "f32", feature = "f64")))]
+compile_error!("Either feature `f32` or `f64` must be enabled (default is `f32`)");
+
+#[cfg(all(feature = "f32", not(feature = "f64")))]
+pub type Float = f32;
+
+#[cfg(all(feature = "f64", not(feature = "f32")))]
+pub type Float = f64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
@@ -15,25 +30,17 @@ pub enum Precision {
     F64,
 }
 
+#[cfg(all(feature = "f32", not(feature = "f64")))]
+pub const ACTIVE_PRECISION: Precision = Precision::F32;
+
+#[cfg(all(feature = "f64", not(feature = "f32")))]
+pub const ACTIVE_PRECISION: Precision = Precision::F64;
+
 impl fmt::Display for Precision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Precision::F32 => f.write_str("f32"),
             Precision::F64 => f.write_str("f64"),
-        }
-    }
-}
-
-impl FromStr for Precision {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "f32" => Ok(Precision::F32),
-            "f64" => Ok(Precision::F64),
-            _ => Err(format!(
-                "unsupported precision '{value}', expected 'f32' or 'f64'"
-            )),
         }
     }
 }

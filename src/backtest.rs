@@ -1,7 +1,7 @@
 use crate::data::CandleSeries;
 use crate::exchange::Level;
 use crate::metrics::{max_drawdown, sharpe_ratio};
-use crate::precision::{BacktestFloat, Precision};
+use crate::precision::{BacktestFloat, Float, Precision, ACTIVE_PRECISION};
 use crate::ta_wrapper;
 use anyhow::Context;
 use rayon::prelude::*;
@@ -33,8 +33,6 @@ pub struct RunConfig {
     pub starting_capital: f32,
     pub fee_rate: f32,
     pub execution_model: ExecutionModel,
-    pub precision: Precision,
-    pub compare_precisions: bool,
     pub show_progress: bool,
     pub progress_step: usize,
     pub download_start: u64,
@@ -72,7 +70,6 @@ pub struct PrecisionRun {
 #[derive(Clone, Copy, Debug)]
 pub struct RunReport {
     pub selected: PrecisionRun,
-    pub comparison: Option<(PrecisionRun, PrecisionRun)>,
 }
 
 pub fn periods_per_year(level: Level) -> usize {
@@ -184,19 +181,12 @@ pub fn backtest_double_ema<T: BacktestFloat>(
         let previous_fast = ema1[i - 1];
         let previous_slow = ema2[i - 1];
 
-        if previous_fast.is_finite()
-            && previous_slow.is_finite()
-            && !in_position
-            && previous_fast > previous_slow
-        {
+        let signal_valid = previous_fast.is_finite() && previous_slow.is_finite();
+        if signal_valid && !in_position && previous_fast > previous_slow {
             asset_quantity = usdt / trade_price * (T::ONE - config.fee_rate);
             usdt = T::ZERO;
             in_position = true;
-        } else if previous_fast.is_finite()
-            && previous_slow.is_finite()
-            && in_position
-            && previous_fast < previous_slow
-        {
+        } else if signal_valid && in_position && previous_fast < previous_slow {
             usdt = asset_quantity * trade_price * (T::ONE - config.fee_rate);
             asset_quantity = T::ZERO;
             in_position = false;
@@ -302,6 +292,16 @@ fn run_precision_sweep_impl<T: BacktestFloat>(
     })
 }
 
+#[cfg(all(feature = "f32", not(feature = "f64")))]
+fn to_active_floats(prices: &[f32]) -> Vec<Float> {
+    prices.to_vec()
+}
+
+#[cfg(all(feature = "f64", not(feature = "f32")))]
+fn to_active_floats(prices: &[f32]) -> Vec<Float> {
+    prices.iter().copied().map(f64::from).collect()
+}
+
 pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<RunReport> {
     let pool = ThreadPoolBuilder::new()
         .num_threads(config.threads)
@@ -314,104 +314,20 @@ pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<RunReport
         config.max_period,
     );
 
-    if config.compare_precisions {
-        let open_f64: Vec<f64> = market.open_prices.iter().copied().map(f64::from).collect();
-        let close_f64: Vec<f64> = market.close_prices.iter().copied().map(f64::from).collect();
+    let open = to_active_floats(&market.open_prices);
+    let close = to_active_floats(&market.close_prices);
 
-        let (f32_result, f64_result) = pool.install(|| {
-            rayon::join(
-                || {
-                    run_precision_sweep_impl::<f32>(
-                        &pool,
-                        &config,
-                        &market.open_prices,
-                        &market.close_prices,
-                        Precision::F32,
-                        config.show_progress,
-                        &parameter_pairs,
-                    )
-                },
-                || {
-                    run_precision_sweep_impl::<f64>(
-                        &pool,
-                        &config,
-                        &open_f64,
-                        &close_f64,
-                        Precision::F64,
-                        config.show_progress,
-                        &parameter_pairs,
-                    )
-                },
-            )
-        });
-        let f32_run = f32_result?;
-        let f64_run = f64_result?;
-        let selected = if config.precision == Precision::F64 {
-            f64_run
-        } else {
-            f32_run
-        };
-        Ok(RunReport {
-            selected,
-            comparison: Some((f32_run, f64_run)),
-        })
-    } else {
-        let selected = match config.precision {
-            Precision::F32 => run_precision_sweep_impl::<f32>(
-                &pool,
-                &config,
-                &market.open_prices,
-                &market.close_prices,
-                Precision::F32,
-                config.show_progress,
-                &parameter_pairs,
-            )?,
-            Precision::F64 => {
-                let open_f64: Vec<f64> =
-                    market.open_prices.iter().copied().map(f64::from).collect();
-                let close_f64: Vec<f64> =
-                    market.close_prices.iter().copied().map(f64::from).collect();
-                run_precision_sweep_impl::<f64>(
-                    &pool,
-                    &config,
-                    &open_f64,
-                    &close_f64,
-                    Precision::F64,
-                    config.show_progress,
-                    &parameter_pairs,
-                )?
-            }
-        };
-        Ok(RunReport {
-            selected,
-            comparison: None,
-        })
-    }
-}
+    let selected = run_precision_sweep_impl::<Float>(
+        &pool,
+        &config,
+        &open,
+        &close,
+        ACTIVE_PRECISION,
+        config.show_progress,
+        &parameter_pairs,
+    )?;
 
-pub fn fmt_run(run: &PrecisionRun) -> String {
-    format!(
-        "{} -> {:.3}s | sharpe {:.6} | final ${:.3} | max_dd {:.4}% | periods ({}, {})",
-        run.precision,
-        run.duration.as_secs_f64(),
-        run.best.metrics.sharpe_ratio,
-        run.best.metrics.final_value,
-        run.best.metrics.max_drawdown,
-        run.best.fast_period,
-        run.best.slow_period,
-    )
-}
-
-pub fn print_precision_comparison(f32_run: PrecisionRun, f64_run: PrecisionRun) {
-    println!("Precision comparison on identical input candles:");
-    println!("  {}", fmt_run(&f32_run));
-    println!("  {}", fmt_run(&f64_run));
-    println!(
-        "  delta -> duration {:+.3}s | final {:+.6} | sharpe {:+.6}",
-        f64_run.duration.as_secs_f64() - f32_run.duration.as_secs_f64(),
-        f64_run.best.metrics.final_value - f32_run.best.metrics.final_value,
-        f64_run.best.metrics.sharpe_ratio - f32_run.best.metrics.sharpe_ratio
-    );
+    Ok(RunReport { selected })
 }
 
 #[cfg(test)]

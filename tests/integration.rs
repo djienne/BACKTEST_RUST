@@ -1,7 +1,7 @@
 use backtest_rust::backtest::{run, ExecutionModel, RunConfig};
 use backtest_rust::data::CandleSeries;
 use backtest_rust::exchange::Level;
-use backtest_rust::precision::Precision;
+use backtest_rust::precision::ACTIVE_PRECISION;
 
 fn synthetic_market(n: usize) -> CandleSeries {
     let mut timestamps = Vec::with_capacity(n);
@@ -32,8 +32,6 @@ fn small_config() -> RunConfig {
         starting_capital: 1000.0,
         fee_rate: 0.0015,
         execution_model: ExecutionModel::NextOpen,
-        precision: Precision::F32,
-        compare_precisions: false,
         show_progress: false,
         progress_step: 100,
         download_start: 0,
@@ -46,7 +44,7 @@ fn run_is_deterministic_on_synthetic_market() {
     let report1 = run(small_config(), &market).unwrap();
     let report2 = run(small_config(), &market).unwrap();
 
-    assert_eq!(report1.selected.precision, Precision::F32);
+    assert_eq!(report1.selected.precision, ACTIVE_PRECISION);
     assert_eq!(
         report1.selected.best.fast_period,
         report2.selected.best.fast_period
@@ -61,19 +59,4 @@ fn run_is_deterministic_on_synthetic_market() {
             .abs()
             < 1e-9
     );
-}
-
-#[test]
-fn run_in_compare_mode_returns_both_runs() {
-    let market = synthetic_market(200);
-    let mut config = small_config();
-    config.compare_precisions = true;
-
-    let report = run(config, &market).unwrap();
-    let (f32_run, f64_run) = report.comparison.expect("comparison should be present");
-    assert_eq!(f32_run.precision, Precision::F32);
-    assert_eq!(f64_run.precision, Precision::F64);
-    // Same parameter pair should win across precisions on a smooth synthetic series.
-    assert_eq!(f32_run.best.fast_period, f64_run.best.fast_period);
-    assert_eq!(f32_run.best.slow_period, f64_run.best.slow_period);
 }
