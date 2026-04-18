@@ -1,4 +1,5 @@
 use crate::precision::BacktestFloat;
+use rayon::prelude::*;
 
 /// Calculate EMA for a given vector of closing prices and a period.
 /// Initial values before the period are met are set to NaN.
@@ -35,10 +36,10 @@ pub struct EMAStore<T> {
 
 impl<T: BacktestFloat> EMAStore<T> {
     pub fn new(close_prices: &[T], period_min: usize, period_max: usize) -> Self {
-        let mut emas = Vec::with_capacity(period_max.saturating_sub(period_min) + 1);
-        for period in period_min..=period_max {
-            emas.push(calculate_ema(close_prices, period));
-        }
+        let emas: Vec<Vec<T>> = (period_min..=period_max)
+            .into_par_iter()
+            .map(|period| calculate_ema(close_prices, period))
+            .collect();
         EMAStore { period_min, emas }
     }
 

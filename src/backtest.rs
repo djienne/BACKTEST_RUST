@@ -124,16 +124,6 @@ pub fn prefer_sweep_result(left: SweepResult, right: SweepResult) -> SweepResult
     }
 }
 
-fn entry_price<T: BacktestFloat>(
-    execution_model: ExecutionModel,
-    open_prices: &[T],
-    index: usize,
-) -> T {
-    match execution_model {
-        ExecutionModel::NextOpen => open_prices[index],
-    }
-}
-
 fn numeric_backtest_config<T: BacktestFloat>(config: &RunConfig) -> NumericBacktestConfig<T> {
     NumericBacktestConfig {
         periods_per_year: periods_per_year(config.level),
@@ -166,16 +156,28 @@ pub fn backtest_double_ema<T: BacktestFloat>(
     let mut in_position = false;
     let mut previous_value: T = usdt;
 
-    let mut portfolio_values = Vec::with_capacity(close_prices.len());
+    let n = close_prices.len();
+    let mut portfolio_values = Vec::with_capacity(n);
     portfolio_values.push(usdt);
-    let mut returns = Vec::with_capacity(close_prices.len() - 1);
+    let mut returns = Vec::with_capacity(n - 1);
 
-    for i in 1..close_prices.len() {
-        let trade_price = entry_price(config.execution_model, open_prices, i);
-        let mark_price = close_prices[i];
-        let previous_fast = ema1[i - 1];
-        let previous_slow = ema2[i - 1];
+    // 4-way zip over the four input slices: trade/mark prices come from
+    // [1..], EMA signals from [..n-1]. The slice creation is bounds-checked
+    // once; the iterator chain lowers to four pointer-bumps with no
+    // per-element check inside the hot loop.
+    let trades = match config.execution_model {
+        ExecutionModel::NextOpen => &open_prices[1..],
+    };
+    let marks = &close_prices[1..];
+    let prev_fast = &ema1[..n - 1];
+    let prev_slow = &ema2[..n - 1];
 
+    for (((&trade_price, &mark_price), &previous_fast), &previous_slow) in trades
+        .iter()
+        .zip(marks.iter())
+        .zip(prev_fast.iter())
+        .zip(prev_slow.iter())
+    {
         let signal_valid = previous_fast.is_finite() && previous_slow.is_finite();
         if signal_valid && !in_position && previous_fast > previous_slow {
             asset_quantity = usdt / trade_price * (T::ONE - config.fee_rate);
@@ -243,40 +245,55 @@ fn run_precision_sweep_impl<T: BacktestFloat>(
         .install(|| {
             parameter_pairs
                 .par_iter()
-                .map(|&(fast_period, slow_period)| {
-                    let fast_ema = ema_store
-                        .get_ema(fast_period)
-                        .unwrap_or_else(|| panic!("EMA store missing period {fast_period}"));
-                    let slow_ema = ema_store
-                        .get_ema(slow_period)
-                        .unwrap_or_else(|| panic!("EMA store missing period {slow_period}"));
-                    let metrics = backtest_double_ema(
-                        open_prices,
-                        close_prices,
-                        fast_ema,
-                        slow_ema,
-                        backtest_config,
-                    );
-
-                    let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if show_progress
-                        && (count.is_multiple_of(config.progress_step)
-                            || count == total_iterations)
-                    {
-                        let percentage = (count as f32 / total_iterations as f32) * 100.0;
-                        println!(
-                            "  ...Progress: {:6}/{:6} iterations completed {:5.1}%.",
-                            count, total_iterations, percentage
+                .fold(
+                    || None::<SweepResult>,
+                    |acc, &(fast_period, slow_period)| {
+                        let fast_ema = ema_store.get_ema(fast_period).unwrap_or_else(|| {
+                            panic!("EMA store missing period {fast_period}")
+                        });
+                        let slow_ema = ema_store.get_ema(slow_period).unwrap_or_else(|| {
+                            panic!("EMA store missing period {slow_period}")
+                        });
+                        let metrics = backtest_double_ema(
+                            open_prices,
+                            close_prices,
+                            fast_ema,
+                            slow_ema,
+                            backtest_config,
                         );
-                    }
 
-                    SweepResult {
-                        metrics,
-                        fast_period,
-                        slow_period,
-                    }
-                })
-                .reduce_with(prefer_sweep_result)
+                        let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if show_progress
+                            && (count.is_multiple_of(config.progress_step)
+                                || count == total_iterations)
+                        {
+                            let percentage =
+                                (count as f32 / total_iterations as f32) * 100.0;
+                            println!(
+                                "  ...Progress: {:6}/{:6} iterations completed {:5.1}%.",
+                                count, total_iterations, percentage
+                            );
+                        }
+
+                        let candidate = SweepResult {
+                            metrics,
+                            fast_period,
+                            slow_period,
+                        };
+                        Some(match acc {
+                            Some(prev) => prefer_sweep_result(prev, candidate),
+                            None => candidate,
+                        })
+                    },
+                )
+                .reduce(
+                    || None::<SweepResult>,
+                    |a, b| match (a, b) {
+                        (Some(x), Some(y)) => Some(prefer_sweep_result(x, y)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    },
+                )
         })
         .with_context(|| "EMA parameter search space is empty")?;
 
