@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::ops::RangeFrom;
+use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const INTER_PAGE_DELAY_MS: u64 = 50;
+
+// All variants are kept so the candlestick interval can be selected via
+// configuration. The current binary defaults to Hour4; the rest stay around
+// for any future timeframe selection (env var, CLI flag, or strategy config).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
@@ -58,17 +63,46 @@ pub struct K {
     pub close: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeRange {
     pub start: u64,
-    pub end: u64,
+    /// Inclusive upper bound; `None` means "up to current wall-clock time".
+    pub end: Option<u64>,
 }
 
 impl From<RangeFrom<u64>> for TimeRange {
     fn from(value: RangeFrom<u64>) -> Self {
         Self {
             start: value.start,
-            end: u64::MAX - 1,
+            end: None,
+        }
+    }
+}
+
+impl From<Range<u64>> for TimeRange {
+    fn from(value: Range<u64>) -> Self {
+        Self {
+            start: value.start,
+            end: value.end.checked_sub(1),
+        }
+    }
+}
+
+impl From<RangeInclusive<u64>> for TimeRange {
+    fn from(value: RangeInclusive<u64>) -> Self {
+        let (start, end) = value.into_inner();
+        Self {
+            start,
+            end: Some(end),
+        }
+    }
+}
+
+impl From<RangeFull> for TimeRange {
+    fn from(_value: RangeFull) -> Self {
+        Self {
+            start: 0,
+            end: None,
         }
     }
 }
@@ -88,6 +122,11 @@ impl Binance {
     }
 
     pub async fn get_k(&self, product: &str, level: Level, time: u64) -> Result<Vec<K>> {
+        if product.contains("SWAP") {
+            return Err(anyhow!(
+                "SWAP / futures products are not supported by this client (got {product})"
+            ));
+        }
         let symbol = product.replace('-', "");
         let interval = level.as_binance_str();
 
@@ -159,27 +198,13 @@ where
     let range = range.into();
     let mut result = Vec::new();
 
-    if range.start == 0 && range.end == 0 {
-        let mut time = 0;
-        loop {
-            let v = exchange.get_k(product, level, time).await?;
-            if let Some(k) = v.last() {
-                time = k.time;
-                result.extend(v);
-            } else {
-                break;
-            }
-        }
-        return Ok(result);
-    }
-
-    let mut end = range.end;
-    if end == u64::MAX - 1 {
-        end = SystemTime::now()
+    let mut end = match range.end {
+        Some(end) => end,
+        None => SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock before unix epoch")?
-            .as_millis() as u64;
-    }
+            .as_millis() as u64,
+    };
 
     loop {
         let v = exchange.get_k(product, level, end).await?;
@@ -194,6 +219,7 @@ where
             }
             end = k.time;
             result.extend(v);
+            tokio::time::sleep(Duration::from_millis(INTER_PAGE_DELAY_MS)).await;
         } else {
             break;
         }
@@ -217,6 +243,36 @@ mod tests {
     fn time_range_from_range_from_uses_unbounded_end() {
         let range: TimeRange = (1_000u64..).into();
         assert_eq!(range.start, 1_000);
-        assert_eq!(range.end, u64::MAX - 1);
+        assert_eq!(range.end, None);
+    }
+
+    #[test]
+    fn time_range_from_range_inclusive_keeps_end() {
+        let range: TimeRange = (10u64..=20).into();
+        assert_eq!(range.start, 10);
+        assert_eq!(range.end, Some(20));
+    }
+
+    #[test]
+    fn time_range_from_range_makes_end_inclusive_minus_one() {
+        let range: TimeRange = (10u64..20).into();
+        assert_eq!(range.start, 10);
+        assert_eq!(range.end, Some(19));
+    }
+
+    #[test]
+    fn time_range_from_range_full_is_unbounded_from_zero() {
+        let range: TimeRange = (..).into();
+        assert_eq!(range.start, 0);
+        assert_eq!(range.end, None);
+    }
+
+    #[tokio::test]
+    async fn binance_get_k_rejects_swap_products() {
+        let exchange = Binance::new().unwrap();
+        let result = exchange.get_k("BTC-USDT-SWAP", Level::Hour4, 0).await;
+        assert!(result.is_err());
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("SWAP"), "error message: {message}");
     }
 }

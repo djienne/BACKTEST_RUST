@@ -1,3 +1,10 @@
+//! Precision selection and float abstraction for the backtest sweep.
+//!
+//! `BacktestFloat` is a small in-house trait covering the f32/f64 ops the
+//! sweep needs. We deliberately don't depend on `num-traits::Float` to keep
+//! the dependency surface tight; switching is a one-line change if more
+//! numeric ops become necessary.
+
 use std::fmt;
 use std::ops::{Add, Div, Mul, Sub};
 use std::str::FromStr;

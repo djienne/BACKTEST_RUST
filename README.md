@@ -2,10 +2,12 @@
 
 `backtest_rust` is a Rust backtester that downloads or reuses Binance candlestick data, brute-forces double-EMA parameter pairs for one market and timeframe, and reports the best result by Sharpe ratio.
 
-Two backtesting layers exist in the repository:
+The codebase is split into small modules:
 
-- `src/main.rs` is the active executable path used by the binary.
-- `src/auto_trading/` is a more generic framework that is currently exercised through tests and shared utilities, but it is not the entry point for the brute-force sweep.
+- `src/main.rs` is the binary entry point: reads env vars, downloads/loads candles, calls `backtest::run`, prints + writes results.
+- `src/backtest.rs` owns the sweep, backtest loop, and the `RunConfig`/`RunReport` types.
+- `src/exchange.rs`, `src/download.rs`, `src/data.rs`, `src/output.rs`, `src/metrics.rs`, `src/ta_wrapper.rs`, `src/precision.rs` are focused single-responsibility modules.
+- `src/lib.rs` re-exports the modules so `tests/integration.rs` can drive `run()` end-to-end against synthetic data without touching the network.
 
 The current default run is hardcoded to:
 
@@ -34,6 +36,7 @@ The current data download starts at `2019-01-01T00:00:00Z`.
 
 - Rust with Cargo installed.
 - Internet access for the first run, unless the needed candle file is already present in `dataKLines/`.
+- Only Binance **spot** products are supported. `*-SWAP` / futures symbols are rejected with a clear error.
 
 ## Quick start
 
@@ -90,28 +93,23 @@ Values you are most likely to change live in `src/main.rs`:
 ## Notes on numeric precision
 
 - The expensive EMA sweep is generic over `f32` and `f64`.
-- `f32` mode keeps the hot-loop data arrays and EMA storage in `f32`, which uses less memory and was faster on the default run below.
+- `f32` mode keeps the hot-loop data arrays and EMA storage in `f32`, which uses less memory.
 - `f64` mode widens the hot-loop data arrays and EMA storage to `f64`, which is useful when you want less cumulative rounding drift in the sweep.
 - The candle input values are the same between both runs; only the arithmetic/storage precision differs inside the expensive loop.
+- In comparison mode (`BACKTEST_COMPARE_PRECISIONS=1`) the f32 and f64 sweeps run in parallel via `rayon::join`, so the wall-clock time is roughly `max(f32, f64)` rather than `f32 + f64`.
 
-Quick comparison from `cargo run --release` with:
-
-- default `BTC-USDT` / `4h` sweep
-- same cached candle file
-- progress logging disabled
-
-Observed on this machine:
+Sample comparison run on the cached `BTC-USDT 4h` data (2019-01-01 → 2024-05-16):
 
 | Precision | Duration | Best periods | Final value | Sharpe | Max drawdown |
 | --- | ---: | --- | ---: | ---: | ---: |
-| `f32` | `1.948s` | `(29, 148)` | `45259.496` | `1.440853` | `45.6798%` |
-| `f64` | `2.694s` | `(29, 148)` | `45282.640` | `1.441065` | `45.5372%` |
+| `f32` | `2.081s` | `(36, 133)` | `36212.676` | `1.672353` | `40.9240%` |
+| `f64` | `2.074s` | `(36, 133)` | `36212.699` | `1.672332` | `40.9240%` |
 
 Quick comment:
 
-- In this repo's current default run, `f64` was about `38%` slower than `f32`.
-- The winning EMA pair stayed the same.
-- The result difference was small but non-zero: about `+23.144 USDT` final value and `+0.000211` Sharpe for `f64`.
+- The winning EMA pair stayed the same across precisions.
+- Final-value difference was about `+0.024 USDT` for `f64`; Sharpe difference was `~2e-5`.
+- Both precisions ran concurrently here, so the per-precision durations sum to roughly the wall-clock time of the full run, not double it.
 - Treat these numbers as machine- and dataset-specific, not universal benchmark claims.
 
 - `backtest_rust_f16.zip` is best treated as an archived experiment, not part of the current build or documented runtime path.

@@ -27,56 +27,7 @@ pub fn calculate_ema<T: BacktestFloat>(close_prices: &[T], period: usize) -> Vec
     ema_values
 }
 
-/// Calculate the Relative Strength Index (RSI)
-#[cfg(test)]
-pub fn calculate_rsi(close_prices: &[f32], period: usize) -> Vec<f32> {
-    let mut rsi_values = vec![f32::NAN; close_prices.len()];
-
-    if period == 0 || close_prices.len() <= period {
-        return rsi_values;
-    }
-
-    let mut average_gain = 0.0;
-    let mut average_loss = 0.0;
-
-    for index in 1..=period {
-        let delta = close_prices[index] - close_prices[index - 1];
-        if delta >= 0.0 {
-            average_gain += delta;
-        } else {
-            average_loss -= delta;
-        }
-    }
-
-    average_gain /= period as f32;
-    average_loss /= period as f32;
-    rsi_values[period] = compute_rsi(average_gain, average_loss);
-
-    for index in period + 1..close_prices.len() {
-        let delta = close_prices[index] - close_prices[index - 1];
-        let gain = delta.max(0.0);
-        let loss = (-delta).max(0.0);
-
-        average_gain = (average_gain * (period as f32 - 1.0) + gain) / period as f32;
-        average_loss = (average_loss * (period as f32 - 1.0) + loss) / period as f32;
-        rsi_values[index] = compute_rsi(average_gain, average_loss);
-    }
-
-    rsi_values
-}
-
-#[cfg(test)]
-fn compute_rsi(average_gain: f32, average_loss: f32) -> f32 {
-    if average_loss == 0.0 {
-        100.0
-    } else {
-        let relative_strength = average_gain / average_loss;
-        100.0 - 100.0 / (1.0 + relative_strength)
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////
-// Stuctures containing all needed indicators (selected periods)
+/// Stores all needed indicators (EMA values for selected periods).
 pub struct EMAStore<T> {
     period_min: usize,
     emas: Vec<Vec<T>>,
@@ -91,12 +42,13 @@ impl<T: BacktestFloat> EMAStore<T> {
         EMAStore { period_min, emas }
     }
 
-    pub fn get_ema(&self, period: usize) -> &[T] {
+    /// Returns the precomputed EMA series for `period`, or `None` if `period`
+    /// was outside the `[period_min, period_max]` range supplied at construction.
+    pub fn get_ema(&self, period: usize) -> Option<&[T]> {
         period
             .checked_sub(self.period_min)
             .and_then(|index| self.emas.get(index))
             .map(Vec::as_slice)
-            .unwrap_or(&[])
     }
 }
 
@@ -107,16 +59,15 @@ mod tests {
     #[test]
     fn ema_period_one_is_safe_and_matches_prices() {
         let values = calculate_ema(&[1.0_f32, 2.0, 3.0], 1);
-
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn rsi_period_one_is_safe() {
-        let values = calculate_rsi(&[1.0, 2.0, 3.0], 1);
-
-        assert!(values[0].is_nan());
-        assert_eq!(values[1], 100.0);
-        assert_eq!(values[2], 100.0);
+    fn ema_store_returns_none_for_periods_outside_range() {
+        let store = EMAStore::<f32>::new(&[1.0, 2.0, 3.0], 2, 4);
+        assert!(store.get_ema(1).is_none());
+        assert!(store.get_ema(5).is_none());
+        assert!(store.get_ema(2).is_some());
+        assert!(store.get_ema(4).is_some());
     }
 }
