@@ -394,7 +394,7 @@ impl Exchange for Okx {
 #[derive(Debug, Clone)]
 pub struct Binance {
     client: reqwest::Client,
-    base_url: String,
+    base_url_override: Option<String>,
 }
 
 impl Binance {
@@ -403,14 +403,14 @@ impl Binance {
             client: reqwest::ClientBuilder::new()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?,
-            base_url: "https://".to_string(),
+            base_url_override: None,
         })
     }
 
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
-            base_url: "https://".to_string(),
+            base_url_override: None,
         }
     }
 
@@ -418,8 +418,20 @@ impl Binance {
     where
         S: AsRef<str>,
     {
-        self.base_url = base_url.as_ref().to_string();
+        self.base_url_override = Some(base_url.as_ref().trim_end_matches('/').to_string());
         self
+    }
+
+    fn endpoint(&self, is_futures: bool, path: &str) -> String {
+        let base_url = self.base_url_override.as_deref().unwrap_or({
+            if is_futures {
+                "https://fapi.binance.com"
+            } else {
+                "https://api.binance.com"
+            }
+        });
+
+        format!("{base_url}{path}")
     }
 }
 
@@ -460,46 +472,44 @@ impl crate::Exchange for Binance {
             Level::Month1 => "1M",
         };
 
-        let mut url = self.base_url.clone();
-
         let new_product = product.trim_end_matches("SWAP");
-
-        let args = if product.ends_with("SWAP") {
-            url += "fapi.binance.com/fapi/v1/continuousKlines";
-
-            if time == 0 {
-                serde_json::json!({
-                    "pair": new_product,
-                    "interval": level,
-                    "contractType": "PERPETUAL",
-                    "limit": 1500
-                })
-            } else {
-                serde_json::json!({
-                    "pair": new_product,
-                    "interval": level,
-                    "contractType": "PERPETUAL",
-                    "endTime": time - 1,
-                    "limit": 1500
-                })
-            }
+        let is_futures = product.ends_with("SWAP");
+        let url = if is_futures {
+            self.endpoint(true, "/fapi/v1/continuousKlines")
         } else {
-            url += "api.binance.com/api/v3/klines";
+            self.endpoint(false, "/api/v3/klines")
+        };
 
+        let args = if is_futures {
             if time == 0 {
                 serde_json::json!({
-                    "symbol": new_product,
+                    "pair": new_product,
                     "interval": level,
+                    "contractType": "PERPETUAL",
                     "limit": 1500
                 })
             } else {
                 serde_json::json!({
-                    "symbol": new_product,
+                    "pair": new_product,
                     "interval": level,
+                    "contractType": "PERPETUAL",
                     "endTime": time - 1,
                     "limit": 1500
                 })
             }
+        } else if time == 0 {
+            serde_json::json!({
+                "symbol": new_product,
+                "interval": level,
+                "limit": 1500
+            })
+        } else {
+            serde_json::json!({
+                "symbol": new_product,
+                "interval": level,
+                "endTime": time - 1,
+                "limit": 1500
+            })
         };
 
         let result = self
@@ -521,7 +531,7 @@ impl crate::Exchange for Binance {
             let values = value_array(i, "binance klines item")?;
             result.push(K {
                 time: values
-                    .get(0)
+                    .first()
                     .and_then(serde_json::Value::as_u64)
                     .ok_or(anyhow::anyhow!(
                         "binance klines item: missing or invalid open time in {i}"
@@ -575,14 +585,18 @@ impl crate::Exchange for Binance {
 
         let new_product = product.trim_end_matches("SWAP");
 
-        let url = self.base_url.clone()
-            + if product.ends_with("SWAP") {
-                "fapi.binance.com/fapi/v1/exchangeInfo"
-            } else {
-                "api.binance.com/api/v3/exchangeInfo"
-            }
-            + "?symbol="
-            + new_product;
+        let url = format!(
+            "{}?symbol={}",
+            self.endpoint(
+                product.ends_with("SWAP"),
+                if product.ends_with("SWAP") {
+                    "/fapi/v1/exchangeInfo"
+                } else {
+                    "/api/v3/exchangeInfo"
+                }
+            ),
+            new_product
+        );
 
         let result = self
             .client
@@ -624,14 +638,18 @@ impl crate::Exchange for Binance {
 
         let new_product = product.trim_end_matches("SWAP");
 
-        let url = self.base_url.clone()
-            + if product.ends_with("SWAP") {
-                "fapi.binance.com/fapi/v1/exchangeInfo"
-            } else {
-                "api.binance.com/api/v3/exchangeInfo"
-            }
-            + "?symbol="
-            + new_product;
+        let url = format!(
+            "{}?symbol={}",
+            self.endpoint(
+                product.ends_with("SWAP"),
+                if product.ends_with("SWAP") {
+                    "/fapi/v1/exchangeInfo"
+                } else {
+                    "/api/v3/exchangeInfo"
+                }
+            ),
+            new_product
+        );
 
         let result = self
             .client
@@ -673,18 +691,32 @@ impl crate::Exchange for Binance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn mock_base_url(body: &'static str) -> String {
+        mock_base_url_with_capture(body, None).await.0
+    }
+
+    async fn mock_base_url_with_capture(
+        body: &'static str,
+        request_line: Option<Arc<Mutex<String>>>,
+    ) -> (String, Arc<Mutex<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock listener");
         let address = listener.local_addr().expect("listener address");
+        let request_line = request_line.unwrap_or_else(|| Arc::new(Mutex::new(String::new())));
+        let captured_request_line = Arc::clone(&request_line);
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept mock connection");
-            let mut buffer = [0u8; 1024];
-            let _ = socket.read(&mut buffer).await;
+            let mut buffer = vec![0u8; 4096];
+            let bytes_read = socket.read(&mut buffer).await.expect("read mock request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+            if let Some(first_line) = request.lines().next() {
+                *captured_request_line.lock().unwrap() = first_line.to_string();
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -696,7 +728,7 @@ mod tests {
                 .expect("write mock response");
         });
 
-        format!("http://{address}/")
+        (format!("http://{address}/"), request_line)
     }
 
     #[tokio::test]
@@ -742,5 +774,21 @@ mod tests {
         let exchange = Binance::with_client(reqwest::Client::new()).base_url(base_url);
 
         assert!(exchange.get_min_notional("BTC-USDT").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn binance_custom_base_url_uses_clean_paths() {
+        let request_line = Arc::new(Mutex::new(String::new()));
+        let (base_url, captured_request_line) =
+            mock_base_url_with_capture(r#"[ [1000,"1.0","2.0","0.5","1.5"] ]"#, Some(request_line))
+                .await;
+        let exchange = Binance::with_client(reqwest::Client::new()).base_url(base_url);
+
+        exchange.get_k("BTC-USDT", Level::Hour1, 0).await.unwrap();
+
+        let request_line = captured_request_line.lock().unwrap().clone();
+        assert!(request_line.starts_with("GET /api/v3/klines?"));
+        assert!(!request_line.contains("api.binance.com"));
+        assert!(!request_line.contains("fapi.binance.com"));
     }
 }

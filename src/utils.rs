@@ -22,42 +22,40 @@ pub struct MarketData {
     volume: f64,
 }
 
-pub fn convert_f64_to_f32(f64_vec: Vec<f64>) -> Vec<f32> {
-    f64_vec.into_iter().map(|value: f64| value as f32).collect()
-}
-
-pub fn convert_f32_to_f64(f32_values: &[f32]) -> Vec<f64> {
-    f32_values.iter().map(|&value: &f32| value as f64).collect()
-}
-
-fn convert_vec_u64_to_i64(vec_u64: Vec<u64>) -> Vec<i64> {
-    vec_u64
-        .iter()
-        .map(|&x| {
-            if x > i64::MAX as u64 {
-                i64::MAX
-            } else {
-                x as i64
-            }
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandleSeries {
+    pub timestamps: Vec<u64>,
+    pub open_prices: Vec<f32>,
+    pub close_prices: Vec<f32>,
 }
 
 pub fn data_file_path(pair: &str, level: &Level) -> PathBuf {
     Path::new("dataKLines").join(format!("{pair}-{level}.json"))
 }
 
-pub fn load_data_file(pair: &str, level: &Level) -> Result<(Vec<i64>, Vec<f32>)> {
+pub fn results_file_path(pair: &str, level: &Level) -> PathBuf {
+    Path::new("results").join(format!("{pair}-{level}.csv"))
+}
+
+pub fn load_data_file(pair: &str, level: &Level) -> Result<CandleSeries> {
     let k_v = load_k_lines(pair, level)?;
 
-    let close_prices: Vec<f32> = k_v.iter().map(|k| k.close).collect();
-    let timestamps: Vec<u64> = k_v.iter().map(|k| k.time).collect();
-    let timestamps: Vec<i64> = convert_vec_u64_to_i64(timestamps);
+    let timestamps = k_v.iter().map(|k| k.time).collect();
+    let open_prices = k_v.iter().map(|k| k.open).collect();
+    let close_prices = k_v.iter().map(|k| k.close).collect();
 
-    Ok((timestamps, close_prices))
+    Ok(CandleSeries {
+        timestamps,
+        open_prices,
+        close_prices,
+    })
 }
 
 pub fn calculate_max_drawdown(portfolio_values: &[f32]) -> f32 {
+    if portfolio_values.is_empty() {
+        return 0.0;
+    }
+
     let mut max_drawdown = 0.0;
     let mut peak = portfolio_values[0];
 
@@ -65,7 +63,11 @@ pub fn calculate_max_drawdown(portfolio_values: &[f32]) -> f32 {
         if value > peak {
             peak = value;
         }
-        let drawdown = (peak - value) / peak;
+        let drawdown = if peak > 0.0 {
+            (peak - value) / peak
+        } else {
+            0.0
+        };
         if drawdown > max_drawdown {
             max_drawdown = drawdown;
         }
@@ -100,6 +102,7 @@ pub fn calculate_sharpe_ratio(
 }
 
 pub fn write_to_file(
+    output_path: &Path,
     ohlcv_file: &str,
     port_value: f32,
     max_dd: f32,
@@ -107,16 +110,22 @@ pub fn write_to_file(
     period1: usize,
     period2: usize,
 ) -> std::io::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let should_write_header = !output_path.exists()
+        || fs::metadata(output_path)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(true);
     let file = OpenOptions::new()
-        .write(true)
-        .truncate(true) // Truncate the file each time it's opened
+        .append(true)
         .create(true)
-        .open("results.csv")?;
+        .open(output_path)?;
 
     let mut writer = BufWriter::new(file);
 
-    // Check if file is empty to write headers
-    if writer.get_ref().metadata()?.len() == 0 {
+    if should_write_header {
         writeln!(
             writer,
             "Filename,Date,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
@@ -156,18 +165,16 @@ pub fn extract_fields(data: &[MarketData]) -> (Vec<i64>, Vec<f64>) {
 pub fn get_filename(path_str: &str) -> &str {
     let path = Path::new(path_str);
 
-    // Extract the file stem (base name without extension)
     if let Some(stem) = path.file_stem() {
         if let Some(stem_str) = stem.to_str() {
-            //println!("Base name: {}", stem_str);
-            return stem_str;
+            stem_str
         } else {
             println!("File stem contains invalid UTF-8 characters.");
-            return "error";
+            "error"
         }
     } else {
         println!("No base name found in the path.");
-        return "error";
+        "error"
     }
 }
 
@@ -182,39 +189,32 @@ pub fn load_k_lines(pair: &str, level: &Level) -> Result<Vec<K>> {
     Ok(k_v)
 }
 
-fn is_strictly_increasing_and_unique(v: &[K]) -> bool {
+fn ensure_strictly_increasing_and_unique(v: &[K]) -> Result<()> {
     if v.len() <= 1 {
-        return true; // A vector with 0 or 1 element is trivially strictly increasing and unique
+        return Ok(());
     }
-
-    let mut found: bool = false;
 
     for i in 1..v.len() {
         if v[i].time <= v[i - 1].time {
-            println!("{:}", v[i - 1].time);
-            println!("{:}", v[i].time);
-            found = true;
+            anyhow::bail!(
+                "candles must have strictly increasing unique timestamps: {} followed by {}",
+                v[i - 1].time,
+                v[i].time
+            );
         }
     }
 
-    if !found {
-        return true;
-    } else {
-        return false;
-    }
+    Ok(())
 }
 
-fn has_constant_interval(v: &[K]) -> (bool, u64) {
+fn interval_check(v: &[K]) -> (bool, u64) {
     if v.len() <= 1 {
-        return (true, 0); // A vector with 0 or 1 element trivially has a constant interval
+        return (true, 0);
     }
 
-    // Calculate the expected interval from the first two elements
     let expected_interval = v[1].time.wrapping_sub(v[0].time);
-
-    let mut found: bool = false;
-
     let mut max_gap = expected_interval;
+    let mut is_constant = true;
 
     for i in 1..v.len() {
         let interval = v[i].time.wrapping_sub(v[i - 1].time);
@@ -222,22 +222,11 @@ fn has_constant_interval(v: &[K]) -> (bool, u64) {
             if interval > max_gap {
                 max_gap = interval;
             }
-            // println!("{}", i);
-            // println!("{}", expected_interval);
-            // println!("{:}", v[i - 1].time);
-            // println!("{:}", v[i].time);
-            // println!("{:}", v[i + 1].time);
-            // println!("{:}", v[i].time - v[i - 1].time);
-            // println!("{:}", v[i + 1].time - v[i].time);
-            found = true;
+            is_constant = false;
         }
     }
 
-    if !found {
-        return (true, max_gap);
-    } else {
-        return (false, max_gap);
-    }
+    (is_constant, max_gap)
 }
 
 pub async fn download_dump_k_lines_to_json<T>(product: &str, level: Level, range: T) -> Result<()>
@@ -278,12 +267,9 @@ where
 
     // do some checks
 
-    anyhow::ensure!(
-        is_strictly_increasing_and_unique(&k_vec),
-        "Downloaded candlesticks are not strictly increasing and unique"
-    );
+    ensure_strictly_increasing_and_unique(&k_vec)?;
 
-    let (result, maxgap) = has_constant_interval(&k_vec);
+    let (result, maxgap) = interval_check(&k_vec);
 
     if !result {
         println!(
@@ -314,7 +300,7 @@ pub fn was_modified_less_than_x_day_ago(path: &Path, nb_days: u64) -> Result<boo
         .modified()
         .with_context(|| format!("Failed to read modified time for {}", path.display()))?;
 
-    let day = Duration::from_secs(86_400 * nb_days); // 24 hours
+    let day = Duration::from_secs(86_400 * nb_days);
     let elapsed_time = modified_time
         .elapsed()
         .with_context(|| format!("Failed to calculate file age for {}", path.display()))?;
@@ -333,10 +319,62 @@ mod tests {
 
     #[test]
     fn load_data_file_reads_repository_fixture() {
-        let (timestamps, close_prices) =
-            load_data_file("BTC-USDT", &Level::Hour4).expect("fixture data should load");
+        let candles = load_data_file("BTC-USDT", &Level::Hour4).expect("fixture data should load");
 
-        assert_eq!(timestamps.len(), close_prices.len());
-        assert!(!timestamps.is_empty());
+        assert_eq!(candles.timestamps.len(), candles.close_prices.len());
+        assert_eq!(candles.timestamps.len(), candles.open_prices.len());
+        assert!(!candles.timestamps.is_empty());
+    }
+
+    #[test]
+    fn calculate_max_drawdown_is_safe_for_empty_inputs() {
+        assert_eq!(calculate_max_drawdown(&[]), 0.0);
+    }
+
+    #[test]
+    fn write_to_file_appends_results_history() {
+        let output_path = std::env::temp_dir().join(format!(
+            "backtest_rust_results_{}.csv",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        write_to_file(&output_path, "BTC-USDT_4h", 1.0, 2.0, 3.0, 4, 5).unwrap();
+        write_to_file(&output_path, "BTC-USDT_4h", 6.0, 7.0, 8.0, 9, 10).unwrap();
+
+        let contents = fs::read_to_string(&output_path).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "Filename,Date,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
+        );
+
+        fs::remove_file(output_path).unwrap();
+    }
+
+    #[test]
+    fn timestamp_validator_returns_structured_errors() {
+        let candles = vec![
+            K {
+                time: 2,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+            },
+            K {
+                time: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+            },
+        ];
+
+        assert!(ensure_strictly_increasing_and_unique(&candles).is_err());
     }
 }

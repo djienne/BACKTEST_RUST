@@ -112,6 +112,8 @@ pub struct Source {
 
 impl Source {
     pub fn new(value: &[f32]) -> &Self {
+        // SAFETY: `Source` is `#[repr(transparent)]` over `[f32]`, so a slice reference
+        // can be reborrowed as `&Source` without changing layout or lifetime.
         unsafe { &*(value as *const [f32] as *const Self) }
     }
 
@@ -195,13 +197,13 @@ impl std::ops::Index<std::ops::RangeToInclusive<usize>> for Source {
 
 impl PartialEq<i64> for &Source {
     fn eq(&self, other: &i64) -> bool {
-        self.inner[0] == *other as f32
+        self[0] == *other as f32
     }
 }
 
 impl PartialEq<f32> for &Source {
     fn eq(&self, other: &f32) -> bool {
-        &self.inner[0] == other
+        self[0] == *other
     }
 }
 
@@ -923,7 +925,7 @@ impl Config {
     /// * [`Unit::Quantity`] Amount, in units of the currency.
     /// * [`Unit::Proportion`] Proportion of the initial margin used.
     pub fn quantity(mut self, value: Unit) -> Self {
-        self.quantity = value.into();
+        self.quantity = value;
         self
     }
 
@@ -935,7 +937,7 @@ impl Config {
     /// * [`Unit::Quantity`] Amount, in units of fiat currency.
     /// * [`Unit::Proportion`] Proportion of the initial margin used.
     pub fn margin(mut self, value: Unit) -> Self {
-        self.margin = value.into();
+        self.margin = value;
         self
     }
 
@@ -945,7 +947,7 @@ impl Config {
     /// * [`Unit::Quantity`] Amount, such as USDT.
     /// * [`Unit::Proportion`] Proportion of the initial margin used.
     pub fn max_margin(mut self, value: Unit) -> Self {
-        self.max_margin = value.into();
+        self.max_margin = value;
         self
     }
 }
@@ -963,5 +965,17 @@ mod tests {
         assert_eq!(source[1..][0], 2.0);
         assert!(source[10].is_nan());
         assert!(source[10..].is_empty());
+    }
+
+    #[test]
+    fn source_comparisons_do_not_panic_on_empty_slices() {
+        let empty = Source::new(&[]);
+        let equals = empty == 1.0;
+        let greater = empty > 1.0;
+        let lower = empty < 1_i64;
+
+        assert!(!equals);
+        assert!(!greater);
+        assert!(!lower);
     }
 }

@@ -10,8 +10,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 chrono = "0.4"
-ta = "0.5.0"
-threadpool = "1.8.1"
 rayon = "1.5.1"
 tokio = { version = "1.29.1", features = ["full"] }
 reqwest = { version = "0.11.18", features = ["json"] }
@@ -19,7 +17,4 @@ async-trait = "0.1.72"
 overload = "0.1.1"
 
 [profile.release]
-opt-level = 3  # No optimizations, similar to a debug build
-
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
+opt-level = 3  # Full release optimizations.

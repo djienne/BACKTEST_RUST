@@ -211,7 +211,7 @@ impl MatchEngine {
             .iter_mut()
             .find(|v| v.0 == product)
             .map(|v| &mut v.1)
-            .expect(&format!("no product: {}", product))
+            .unwrap_or_else(|| panic!("no product: {}", product))
             .k = k;
     }
 
@@ -1053,7 +1053,7 @@ impl MatchEngine {
                         return if v.quantity < delegate.quantity {
                             let new_margin = v.quantity / delegate.quantity * delegate.margin;
                             let sub_margin = delegate.margin - new_margin;
-                            delegate.quantity = delegate.quantity - v.quantity;
+                            delegate.quantity -= v.quantity;
                             delegate.margin = new_margin;
                             State::Close(DelegateState::Single(Delegate {
                                 side: if v.side == Side::EnterLong {

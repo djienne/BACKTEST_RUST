@@ -5,23 +5,97 @@ use chrono::Utc;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 mod ta_wrapper;
 mod utils;
 use auto_trading::*;
 
-const PAIR: &str = "BTC-USDT";
-const LEVEL: Level = Level::Hour4; // for indicators and entry/exit signals
-const NB_THREADS: usize = 12;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionModel {
+    NextOpen,
+}
+
+impl std::fmt::Display for ExecutionModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionModel::NextOpen => f.write_str("next_open"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunConfig {
+    pair: &'static str,
+    level: Level,
+    threads: usize,
+    fast_period_min: usize,
+    slow_period_min: usize,
+    max_period: usize,
+    starting_capital: f32,
+    fee_rate: f32,
+    execution_model: ExecutionModel,
+    progress_step: usize,
+    download_start: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BacktestMetrics {
+    final_value: f32,
+    max_drawdown: f32,
+    sharpe_ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BacktestConfig {
+    periods_per_year: usize,
+    starting_capital: f32,
+    fee_rate: f32,
+    execution_model: ExecutionModel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SweepResult {
+    metrics: BacktestMetrics,
+    fast_period: usize,
+    slow_period: usize,
+}
+
+fn default_download_start() -> u64 {
+    chrono::NaiveDate::from_ymd_opt(2019, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis() as u64
+}
+
+fn default_run_config() -> RunConfig {
+    RunConfig {
+        pair: "BTC-USDT",
+        level: Level::Hour4,
+        threads: 12,
+        fast_period_min: 5,
+        slow_period_min: 6,
+        max_period: 600,
+        starting_capital: 1000.0,
+        fee_rate: 0.0015,
+        execution_model: ExecutionModel::NextOpen,
+        progress_step: 10_000,
+        download_start: default_download_start(),
+    }
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let start = Instant::now();
+    let config = default_run_config();
 
-    let data_file = utils::data_file_path(PAIR, &LEVEL);
-    if let Err(error) = utils::download_dump_k_lines_to_json(PAIR, LEVEL, 1546300800000..).await {
+    let data_file = utils::data_file_path(config.pair, &config.level);
+    if let Err(error) =
+        utils::download_dump_k_lines_to_json(config.pair, config.level, config.download_start..)
+            .await
+    {
         if !data_file.is_file() {
             return Err(error).with_context(|| {
                 format!(
@@ -39,20 +113,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Load data
 
-    println!("Doing: {:} {:}", PAIR, LEVEL);
+    println!("Doing: {:} {:}", config.pair, config.level);
 
-    let (timestamps, close_prices) = utils::load_data_file(PAIR, &LEVEL)?;
+    let market = utils::load_data_file(config.pair, &config.level)?;
 
-    if let Some(&first_timestamp) = timestamps.first() {
+    if let Some(&first_timestamp) = market.timestamps.first() {
         let first_date = Utc
-            .timestamp_millis_opt(first_timestamp)
+            .timestamp_millis_opt(i64::try_from(first_timestamp)?)
             .single()
             .with_context(|| format!("invalid first timestamp: {first_timestamp}"))?;
         println!("First timestamp : {}", first_date.format("%Y-%m-%d"));
     }
-    if let Some(&last_timestamp) = timestamps.last() {
+    if let Some(&last_timestamp) = market.timestamps.last() {
         let last_date = Utc
-            .timestamp_millis_opt(last_timestamp)
+            .timestamp_millis_opt(i64::try_from(last_timestamp)?)
             .single()
             .with_context(|| format!("invalid last timestamp: {last_timestamp}"))?;
         println!("Last  timestamp : {}", last_date.format("%Y-%m-%d"));
@@ -61,75 +135,84 @@ async fn main() -> anyhow::Result<()> {
     // Calculate all indicators
     println!("Calculating all indicators...");
 
-    let ema_store = Arc::new(ta_wrapper::EMAStore::new(&close_prices, 3, 600));
-    let close_prices = Arc::new(close_prices);
-    let periods_per_year = periods_per_year(LEVEL);
+    let ema_store = ta_wrapper::EMAStore::new(
+        &market.close_prices,
+        config.fast_period_min,
+        config.max_period,
+    );
+    let backtest_config = BacktestConfig {
+        periods_per_year: periods_per_year(config.level),
+        starting_capital: config.starting_capital,
+        fee_rate: config.fee_rate,
+        execution_model: config.execution_model,
+    };
+    let parameter_pairs = ema_parameter_pairs(
+        config.fast_period_min,
+        config.slow_period_min,
+        config.max_period,
+    );
 
     println!("Calculated all indicators.");
 
     // Run backtests
 
-    println!("Running all backtests on {} threads...", NB_THREADS);
-
-    // Prepare for collecting results
-    let best_results = Arc::new(Mutex::new((0.0, 0.0, f32::NEG_INFINITY, 0, 0)));
+    println!("Running all backtests on {} threads...", config.threads);
 
     // Configure and use a custom thread pool
     let pool = ThreadPoolBuilder::new()
-        .num_threads(NB_THREADS)
+        .num_threads(config.threads)
         .build()
         .unwrap();
 
-    let total_iterations = (5..=600)
-        .into_iter()
-        .map(|p1| (p1 + 1..=600).count())
-        .sum::<usize>();
-    let progress_counter = Arc::new(AtomicUsize::new(0));
+    let total_iterations = parameter_pairs.len();
+    let progress_counter = AtomicUsize::new(0);
+    let best = pool
+        .install(|| {
+            parameter_pairs
+                .par_iter()
+                .map(|&(fast_period, slow_period)| {
+                    let metrics = backtest_double_ema(
+                        &market.open_prices,
+                        &market.close_prices,
+                        ema_store.get_ema(fast_period),
+                        ema_store.get_ema(slow_period),
+                        backtest_config,
+                    );
 
-    pool.install(|| {
-        (5..=600).into_par_iter().for_each(|period1| {
-            for period2 in 6..=600 {
-                if period2 > period1 {
-                    let ema1 = ema_store.get_ema(period1);
-                    let ema2 = ema_store.get_ema(period2);
-
-                    let (port_value, max_drawdown, sharpe_ratio) =
-                        backtest_double_ema(close_prices.as_ref(), ema1, ema2, periods_per_year);
-
-                    let mut best = best_results.lock().unwrap();
-                    if sharpe_ratio > best.2 {
-                        *best = (port_value, max_drawdown, sharpe_ratio, period1, period2);
-                    }
-
-                    // Progress update
-                    let count = progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    if count % 10000 == 0 || count == total_iterations {
+                    let count = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(config.progress_step) || count == total_iterations {
                         let percentage = (count as f32 / total_iterations as f32) * 100.0;
                         println!(
                             "  ...Progress: {:6}/{:6} iterations completed {:5.1}%.",
                             count, total_iterations, percentage
                         );
                     }
-                }
-            }
-        });
-    });
+
+                    SweepResult {
+                        metrics,
+                        fast_period,
+                        slow_period,
+                    }
+                })
+                .reduce_with(prefer_sweep_result)
+        })
+        .with_context(|| "EMA parameter search space is empty")?;
 
     println!("Done");
-    let best = best_results.lock().unwrap();
     println!(
         "Best result: sharpe: {:.3}, max_dd: {:.2}, Period1: {}, Period2: {}",
-        best.2, best.1, best.3, best.4
+        best.metrics.sharpe_ratio, best.metrics.max_drawdown, best.fast_period, best.slow_period
     );
-    println!("Final portfolio value: {:.1}$", best.0);
+    println!("Final portfolio value: {:.1}$", best.metrics.final_value);
 
     utils::write_to_file(
-        format!("{}_{}", PAIR, LEVEL).as_str(),
-        best.0,
-        best.1,
-        best.2,
-        best.3,
-        best.4,
+        &utils::results_file_path(config.pair, &config.level),
+        format!("{}_{}", config.pair, config.level).as_str(),
+        best.metrics.final_value,
+        best.metrics.max_drawdown,
+        best.metrics.sharpe_ratio,
+        best.fast_period,
+        best.slow_period,
     )?;
 
     let duration = start.elapsed();
@@ -161,30 +244,82 @@ fn periods_per_year(level: Level) -> usize {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
+fn ema_parameter_pairs(
+    fast_period_min: usize,
+    slow_period_min: usize,
+    max_period: usize,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+
+    for fast_period in fast_period_min..=max_period {
+        let slow_start = slow_period_min.max(fast_period + 1);
+        for slow_period in slow_start..=max_period {
+            pairs.push((fast_period, slow_period));
+        }
+    }
+
+    pairs
+}
+
+fn prefer_sweep_result(left: SweepResult, right: SweepResult) -> SweepResult {
+    if right.metrics.sharpe_ratio > left.metrics.sharpe_ratio {
+        right
+    } else if right.metrics.sharpe_ratio < left.metrics.sharpe_ratio {
+        left
+    } else if right.metrics.final_value > left.metrics.final_value {
+        right
+    } else if right.metrics.final_value < left.metrics.final_value {
+        left
+    } else if (right.fast_period, right.slow_period) < (left.fast_period, left.slow_period) {
+        right
+    } else {
+        left
+    }
+}
+
+fn execution_price(
+    execution_model: ExecutionModel,
+    open_prices: &[f32],
+    close_prices: &[f32],
+    index: usize,
+) -> f32 {
+    match execution_model {
+        ExecutionModel::NextOpen => open_prices
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| close_prices[index]),
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
 fn backtest_double_ema(
+    open_prices: &[f32],
     close_prices: &[f32],
     ema1: &[f32],
     ema2: &[f32],
-    periods_per_year: usize,
-) -> (f32, f32, f32) {
+    config: BacktestConfig,
+) -> BacktestMetrics {
     if close_prices.is_empty()
+        || open_prices.len() != close_prices.len()
         || close_prices.len() != ema1.len()
         || close_prices.len() != ema2.len()
     {
-        return (1000.0, 0.0, 0.0);
+        return BacktestMetrics {
+            final_value: config.starting_capital,
+            max_drawdown: 0.0,
+            sharpe_ratio: 0.0,
+        };
     }
-
-    let mut usdt: f32 = 1000.0; // Starting with 1000 USDT
+    let mut usdt: f32 = config.starting_capital;
     let mut asset_quantity: f32 = 0.0; // Quantity of the asset we own
     let mut in_position = false; // Flag to track if we are currently holding the asset
 
     let mut portfolio_values = vec![usdt]; // Track portfolio values over time
     let mut returns = vec![]; // To calculate the Sharpe Ratio
-    let fee: f32 = 0.15; // %, buy and sell fees
-
-    // Iterate through close_prices to decide when to buy/sell
     for i in 1..close_prices.len() {
-        let current_price = close_prices[i];
+        let execution_price = execution_price(config.execution_model, open_prices, close_prices, i);
+        let mark_price = close_prices[i];
         let previous_value = portfolio_values.last().copied().unwrap();
         let previous_fast = ema1[i - 1];
         let previous_slow = ema2[i - 1];
@@ -194,25 +329,21 @@ fn backtest_double_ema(
             && !in_position
             && previous_fast > previous_slow
         {
-            // Enter position: buy as much as possible with all USDT
-            asset_quantity = usdt / current_price * (1.0 - fee / 100.0);
+            asset_quantity = usdt / execution_price * (1.0 - config.fee_rate);
             usdt = 0.0;
             in_position = true;
-            //println!("Buying at price {}: new asset quantity {}", current_price, asset_quantity);
         } else if previous_fast.is_finite()
             && previous_slow.is_finite()
             && in_position
             && previous_fast < previous_slow
         {
-            // Exit position: sell all of the asset
-            usdt = asset_quantity * current_price * (1.0 - fee / 100.0);
+            usdt = asset_quantity * execution_price * (1.0 - config.fee_rate);
             asset_quantity = 0.0;
             in_position = false;
-            //println!("Selling at price {}: new USDT amount {}", current_price, usdt);
         }
 
         let current_value = if in_position {
-            asset_quantity * current_price
+            asset_quantity * mark_price
         } else {
             usdt
         };
@@ -224,9 +355,13 @@ fn backtest_double_ema(
 
     let final_value = *portfolio_values.last().unwrap();
     let max_drawdown = utils::calculate_max_drawdown(&portfolio_values);
-    let sharpe_ratio = utils::calculate_sharpe_ratio(&returns, 0.0, periods_per_year);
+    let sharpe_ratio = utils::calculate_sharpe_ratio(&returns, 0.0, config.periods_per_year);
 
-    (final_value, max_drawdown, sharpe_ratio)
+    BacktestMetrics {
+        final_value,
+        max_drawdown,
+        sharpe_ratio,
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -237,18 +372,25 @@ mod tests {
 
     #[test]
     fn backtest_waits_for_the_next_bar_after_a_signal() {
-        let close_prices = vec![100.0, 200.0, 100.0];
+        let open_prices = vec![100.0, 100.0, 200.0];
+        let close_prices = vec![100.0, 100.0, 100.0];
         let ema_fast = vec![f32::NAN, 2.0, 2.0];
         let ema_slow = vec![f32::NAN, 1.0, 1.0];
 
-        let (final_value, _, _) = backtest_double_ema(
+        let metrics = backtest_double_ema(
+            &open_prices,
             &close_prices,
             &ema_fast,
             &ema_slow,
-            periods_per_year(Level::Hour4),
+            BacktestConfig {
+                periods_per_year: periods_per_year(Level::Hour4),
+                starting_capital: 1000.0,
+                fee_rate: 0.0015,
+                execution_model: ExecutionModel::NextOpen,
+            },
         );
 
-        assert!((final_value - 998.5).abs() < 1e-3);
+        assert!((metrics.final_value - 499.25).abs() < 1e-3);
     }
 
     #[test]
@@ -256,5 +398,34 @@ mod tests {
         assert_eq!(periods_per_year(Level::Hour4), 6 * 365);
         assert_eq!(periods_per_year(Level::Minute15), 24 * 4 * 365);
         assert_eq!(periods_per_year(Level::Month1), 12);
+    }
+
+    #[test]
+    fn ema_parameter_pairs_match_the_expected_search_space() {
+        assert_eq!(ema_parameter_pairs(5, 6, 7), vec![(5, 6), (5, 7), (6, 7)]);
+    }
+
+    #[test]
+    fn prefer_sweep_result_uses_sharpe_then_final_value_then_periods() {
+        let first = SweepResult {
+            metrics: BacktestMetrics {
+                final_value: 1000.0,
+                max_drawdown: 10.0,
+                sharpe_ratio: 1.0,
+            },
+            fast_period: 10,
+            slow_period: 20,
+        };
+        let second = SweepResult {
+            metrics: BacktestMetrics {
+                final_value: 1010.0,
+                max_drawdown: 12.0,
+                sharpe_ratio: 1.0,
+            },
+            fast_period: 12,
+            slow_period: 24,
+        };
+
+        assert_eq!(prefer_sweep_result(first, second), second);
     }
 }
