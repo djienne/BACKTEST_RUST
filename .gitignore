@@ -1,2 +1,7 @@
 /target
 /results
+# Binary kline caches grow on every run and have no useful git delta — keep
+# them out of the repo. The 4h file is the lone exception: it's the test
+# fixture for `data::tests::load_data_file_reads_repository_fixture`.
+dataKLines/*.feather
+!dataKLines/BTC-USDT-4h.feather
