@@ -51,6 +51,14 @@ impl<T: BacktestFloat> EMAStore<T> {
             .and_then(|index| self.emas.get(index))
             .map(Vec::as_slice)
     }
+
+    /// Build a store directly from precomputed series. Periods are assigned
+    /// `period_min, period_min + 1, ...` in order. Test-only — bypasses the
+    /// EMA calculation so unit tests can pin exact indicator values.
+    #[cfg(test)]
+    pub fn from_series(period_min: usize, periods: Vec<Vec<T>>) -> Self {
+        EMAStore { period_min, emas: periods }
+    }
 }
 
 #[cfg(test)]

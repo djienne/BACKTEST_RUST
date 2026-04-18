@@ -1,9 +1,11 @@
 use anyhow::Context as _;
-use backtest_rust::backtest::{run, ExecutionModel, RunConfig};
+use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
 use backtest_rust::data::{data_file_path, load_data_file, results_file_path};
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 use backtest_rust::output::{write_to_file, ResultRow};
+use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
+use backtest_rust::strategy::Strategy;
 use chrono::TimeZone;
 use chrono::Utc;
 use std::borrow::Cow;
@@ -19,20 +21,25 @@ fn default_download_start() -> u64 {
         .timestamp_millis() as u64
 }
 
-fn default_run_config() -> RunConfig {
-    RunConfig {
+fn default_engine_config() -> EngineConfig {
+    EngineConfig {
         pair: Cow::Borrowed("BTC-USDT"),
         level: Level::Minute15,
         threads: 1,
-        fast_period_min: 5,
-        slow_period_min: 6,
-        max_period: 600,
         starting_capital: 1000.0,
         fee_rate: 0.0015,
         execution_model: ExecutionModel::NextOpen,
         show_progress: true,
         progress_step: 10_000,
         download_start: default_download_start(),
+    }
+}
+
+fn default_strategy_config() -> DoubleEmaConfig {
+    DoubleEmaConfig {
+        fast_period_min: 5,
+        slow_period_min: 6,
+        max_period: 600,
     }
 }
 
@@ -186,8 +193,8 @@ fn print_usage() {
     );
 }
 
-fn load_run_config() -> anyhow::Result<RunConfig> {
-    let mut config = default_run_config();
+fn load_engine_config() -> anyhow::Result<EngineConfig> {
+    let mut config = default_engine_config();
     if let Some(value) = read_env_bool("BACKTEST_SHOW_PROGRESS")? {
         config.show_progress = value;
     }
@@ -215,29 +222,31 @@ async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let cli = parse_cli_args(&raw_args)?;
 
-    let mut config = load_run_config()?;
+    let mut engine = load_engine_config()?;
+    let strategy_config = default_strategy_config();
+
     if let Some(since) = cli.since {
-        config.download_start = since;
+        engine.download_start = since;
     }
     if let Some(level) = cli.level {
-        config.level = level;
+        engine.level = level;
     }
     if let Some(pair) = cli.pair {
-        config.pair = Cow::Owned(pair);
+        engine.pair = Cow::Owned(pair);
     }
     if let Some(threads) = cli.threads {
-        config.threads = threads;
+        engine.threads = threads;
     }
 
     let env_force = read_env_bool("BACKTEST_FORCE_DOWNLOAD")?.unwrap_or(false);
     let force = cli.force_download || env_force || cli.mode == RunMode::DownloadOnly;
 
-    let data_file = data_file_path(&config.pair, &config.level);
+    let data_file = data_file_path(&engine.pair, &engine.level);
 
     let download_result = download_dump_k_lines(
-        &config.pair,
-        config.level,
-        config.download_start..,
+        &engine.pair,
+        engine.level,
+        engine.download_start..,
         force,
     )
     .await;
@@ -246,7 +255,7 @@ async fn main() -> anyhow::Result<()> {
         download_result.with_context(|| {
             format!(
                 "failed to download market data for {} {}",
-                config.pair, config.level
+                engine.pair, engine.level
             )
         })?;
         println!("Download complete: {}", data_file.display());
@@ -269,21 +278,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    println!("Doing: {} {}", config.pair, config.level);
-    let market = load_data_file(&config.pair, &config.level)?;
+    println!("Doing: {} {}", engine.pair, engine.level);
+    let market = load_data_file(&engine.pair, &engine.level)?;
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
-    let selected = run(&config, &market)?;
+    let selected = run::<DoubleEmaCrossover>(&engine, &strategy_config, &market)?;
+    let params_summary = DoubleEmaCrossover::param_summary(selected.best.params);
 
     println!("Done");
+    println!("Strategy: {}", DoubleEmaCrossover::NAME);
     println!("Precision: {}", selected.precision);
     println!(
-        "Best result: sharpe: {:.6}, max_dd: {:.4}, Period1: {}, Period2: {}",
+        "Best result: sharpe: {:.6}, max_dd: {:.4}, params: {}",
         selected.best.metrics.sharpe_ratio,
         selected.best.metrics.max_drawdown,
-        selected.best.fast_period,
-        selected.best.slow_period
+        params_summary,
     );
     println!(
         "Final portfolio value: {:.3}$",
@@ -291,19 +301,19 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("Sweep duration: {:.3}s", selected.duration.as_secs_f64());
 
-    let ohlcv_file = format!("{}-{}", config.pair, config.level);
+    let ohlcv_file = format!("{}-{}", engine.pair, engine.level);
     let precision = selected.precision.to_string();
     write_to_file(
-        &results_file_path(&config.pair, &config.level),
+        &results_file_path(&engine.pair, &engine.level),
         &ResultRow {
             ohlcv_file: &ohlcv_file,
             precision: &precision,
+            strategy: DoubleEmaCrossover::NAME,
+            params: &params_summary,
             duration_ms: selected.duration.as_secs_f64() * 1000.0,
             port_value: selected.best.metrics.final_value,
             max_dd: selected.best.metrics.max_drawdown,
             sharpe_ratio: selected.best.metrics.sharpe_ratio,
-            period1: selected.best.fast_period,
-            period2: selected.best.slow_period,
         },
     )?;
 

@@ -1,7 +1,8 @@
-use backtest_rust::backtest::{run, ExecutionModel, RunConfig};
+use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
 use backtest_rust::data::CandleSeries;
 use backtest_rust::exchange::Level;
 use backtest_rust::precision::ACTIVE_PRECISION;
+use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
 use std::borrow::Cow;
 
 fn synthetic_market(n: usize) -> CandleSeries {
@@ -25,14 +26,11 @@ fn synthetic_market(n: usize) -> CandleSeries {
     }
 }
 
-fn small_config() -> RunConfig {
-    RunConfig {
+fn small_engine() -> EngineConfig {
+    EngineConfig {
         pair: Cow::Borrowed("TEST-USDT"),
         level: Level::Hour1,
         threads: 2,
-        fast_period_min: 3,
-        slow_period_min: 4,
-        max_period: 8,
         starting_capital: 1000.0,
         fee_rate: 0.0015,
         execution_model: ExecutionModel::NextOpen,
@@ -42,14 +40,21 @@ fn small_config() -> RunConfig {
     }
 }
 
+fn small_strategy() -> DoubleEmaConfig {
+    DoubleEmaConfig {
+        fast_period_min: 3,
+        slow_period_min: 4,
+        max_period: 8,
+    }
+}
+
 #[test]
 fn run_is_deterministic_on_synthetic_market() {
     let market = synthetic_market(200);
-    let r1 = run(&small_config(), &market).unwrap();
-    let r2 = run(&small_config(), &market).unwrap();
+    let r1 = run::<DoubleEmaCrossover>(&small_engine(), &small_strategy(), &market).unwrap();
+    let r2 = run::<DoubleEmaCrossover>(&small_engine(), &small_strategy(), &market).unwrap();
 
     assert_eq!(r1.precision, ACTIVE_PRECISION);
-    assert_eq!(r1.best.fast_period, r2.best.fast_period);
-    assert_eq!(r1.best.slow_period, r2.best.slow_period);
+    assert_eq!(r1.best.params, r2.best.params);
     assert!((r1.best.metrics.sharpe_ratio - r2.best.metrics.sharpe_ratio).abs() < 1e-9);
 }

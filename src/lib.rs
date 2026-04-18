@@ -6,4 +6,5 @@ pub mod feather;
 pub mod metrics;
 pub mod output;
 pub mod precision;
+pub mod strategy;
 pub mod ta_wrapper;

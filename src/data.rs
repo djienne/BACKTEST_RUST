@@ -22,7 +22,11 @@ pub fn legacy_json_path(pair: &str, level: &Level) -> PathBuf {
 }
 
 pub fn results_file_path(pair: &str, level: &Level) -> PathBuf {
-    Path::new("results").join(format!("{pair}-{level}.csv"))
+    // `_v2` suffix isolates the new Strategy/Params CSV schema from any old
+    // Period1/Period2 results files that already exist in `results/` —
+    // `write_to_file` only writes the header for empty/missing targets, so
+    // appending to an old file would silently mix two schemas.
+    Path::new("results").join(format!("{pair}-{level}_v2.csv"))
 }
 
 pub fn load_data_file(pair: &str, level: &Level) -> Result<CandleSeries> {
