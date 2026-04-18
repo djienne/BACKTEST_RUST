@@ -1,4 +1,4 @@
-use super::auto_trading::*;
+use super::exchange::{get_k_range, Binance, Level, TimeRange, K};
 use anyhow::{Context, Result};
 use chrono::prelude::*; // This crate provides easy-to-use date and time functions
 use std::fs;

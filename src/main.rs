@@ -1,14 +1,15 @@
-mod auto_trading;
+mod exchange;
+mod ta_wrapper;
+mod utils;
+
 use anyhow::Context as _;
 use chrono::prelude::*; // This crate provides easy-to-use date and time functions
 use chrono::Utc;
+use exchange::Level;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-mod ta_wrapper;
-mod utils;
-use auto_trading::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutionModel {
