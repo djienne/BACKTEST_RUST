@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -108,6 +109,18 @@ impl From<RangeFull> for TimeRange {
     }
 }
 
+/// Source of kline data. Abstracts over the live Binance HTTP client and
+/// any test fake. Concrete impls just need to return one page of candles
+/// ending at (or before) `time`, newest-first. `time = 0` means "now".
+pub trait KlineProvider {
+    fn get_k(
+        &self,
+        product: &str,
+        level: Level,
+        time: u64,
+    ) -> impl Future<Output = Result<Vec<K>>> + Send + '_;
+}
+
 #[derive(Debug, Clone)]
 pub struct Binance {
     client: reqwest::Client,
@@ -121,47 +134,59 @@ impl Binance {
                 .build()?,
         })
     }
+}
 
-    pub async fn get_k(&self, product: &str, level: Level, time: u64) -> Result<Vec<K>> {
-        if product.contains("SWAP") {
-            return Err(anyhow!(
-                "SWAP / futures products are not supported by this client (got {product})"
-            ));
-        }
-        let symbol = product.replace('-', "");
-        let interval = level.as_binance_str();
-        let query = build_klines_query(&symbol, interval, time);
+impl KlineProvider for Binance {
+    fn get_k(
+        &self,
+        product: &str,
+        level: Level,
+        time: u64,
+    ) -> impl Future<Output = Result<Vec<K>>> + Send + '_ {
+        let product = product.to_owned();
+        async move {
+            if product.contains("SWAP") {
+                return Err(anyhow!(
+                    "SWAP / futures products are not supported by this client (got {product})"
+                ));
+            }
+            let symbol = product.replace('-', "");
+            let interval = level.as_binance_str();
+            let query = build_klines_query(&symbol, interval, time);
 
-        let response: serde_json::Value = self
-            .client
-            .get("https://api.binance.com/api/v3/klines")
-            .query(&query)
-            .send()
-            .await?
-            .json()
-            .await?;
+            let response: serde_json::Value = self
+                .client
+                .get("https://api.binance.com/api/v3/klines")
+                .query(&query)
+                .send()
+                .await?
+                .json()
+                .await?;
 
-        let array = response
-            .as_array()
-            .ok_or_else(|| anyhow!("binance klines: expected array, got {response}"))?;
-
-        let mut result = Vec::with_capacity(array.len());
-        for item in array.iter().rev() {
-            let values = item
+            let array = response
                 .as_array()
-                .ok_or_else(|| anyhow!("binance klines item: expected array, got {item}"))?;
-            result.push(K {
-                time: values
-                    .first()
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| anyhow!("binance klines item: missing open time in {item}"))?,
-                open: parse_field(values, 1, "open price", item)?,
-                high: parse_field(values, 2, "high price", item)?,
-                low: parse_field(values, 3, "low price", item)?,
-                close: parse_field(values, 4, "close price", item)?,
-            });
+                .ok_or_else(|| anyhow!("binance klines: expected array, got {response}"))?;
+
+            let mut result = Vec::with_capacity(array.len());
+            for item in array.iter().rev() {
+                let values = item.as_array().ok_or_else(|| {
+                    anyhow!("binance klines item: expected array, got {item}")
+                })?;
+                result.push(K {
+                    time: values
+                        .first()
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            anyhow!("binance klines item: missing open time in {item}")
+                        })?,
+                    open: parse_field(values, 1, "open price", item)?,
+                    high: parse_field(values, 2, "high price", item)?,
+                    low: parse_field(values, 3, "low price", item)?,
+                    close: parse_field(values, 4, "close price", item)?,
+                });
+            }
+            Ok(result)
         }
-        Ok(result)
     }
 }
 
@@ -194,13 +219,14 @@ fn parse_field(
         .map_err(|error| anyhow!("binance klines item: invalid {name} in {item}: {error}"))
 }
 
-pub async fn get_k_range<T>(
-    exchange: &Binance,
+pub async fn get_k_range<P, T>(
+    provider: &P,
     product: &str,
     level: Level,
     range: T,
 ) -> Result<Vec<K>>
 where
+    P: KlineProvider,
     T: Into<TimeRange>,
 {
     let range = range.into();
@@ -215,7 +241,7 @@ where
     };
 
     loop {
-        let v = exchange.get_k(product, level, end).await?;
+        let v = provider.get_k(product, level, end).await?;
         if let Some(k) = v.last() {
             if k.time < range.start {
                 for i in v {
@@ -306,5 +332,120 @@ mod tests {
         assert!(result.is_err());
         let message = format!("{:#}", result.unwrap_err());
         assert!(message.contains("SWAP"), "error message: {message}");
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
+
+    /// Test fake: returns pre-canned pages, records the `time` arg of each
+    /// call so tests can assert on the pagination cursor.
+    struct FakeProvider {
+        pages: Vec<Vec<K>>,
+        cursor: AtomicUsize,
+        received_times: Mutex<Vec<u64>>,
+    }
+
+    impl FakeProvider {
+        fn new(pages: Vec<Vec<K>>) -> Self {
+            Self {
+                pages,
+                cursor: AtomicUsize::new(0),
+                received_times: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<u64> {
+            self.received_times.lock().unwrap().clone()
+        }
+    }
+
+    impl KlineProvider for FakeProvider {
+        fn get_k(
+            &self,
+            _product: &str,
+            _level: Level,
+            time: u64,
+        ) -> impl Future<Output = Result<Vec<K>>> + Send + '_ {
+            async move {
+                self.received_times.lock().unwrap().push(time);
+                let i = self.cursor.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(self.pages.get(i).cloned().unwrap_or_default())
+            }
+        }
+    }
+
+    fn k(time: u64) -> K {
+        K {
+            time,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_k_range_paginates_until_start_reached() {
+        // Two pages, newest-first per page (matches Binance's reversed
+        // post-processing in get_k). Range starts at t=100; page 1 covers
+        // [200..300], page 2 covers [100..200] which is the boundary, page 3
+        // would be empty so the loop terminates at the boundary instead.
+        let page1 = vec![k(300), k(250), k(200)]; // newest-first
+        let page2 = vec![k(200), k(150), k(100)];
+        let provider = FakeProvider::new(vec![page1.clone(), page2.clone()]);
+
+        let result = get_k_range(&provider, "ANY", Level::Hour4, 100u64..=300u64)
+            .await
+            .unwrap();
+
+        // First call must use the inclusive end (300) per A1's fix.
+        let calls = provider.calls();
+        assert_eq!(calls[0], 300, "first call must pass the inclusive end");
+        // Second call must move past the oldest of page1 (200) to avoid
+        // refetching it: 200 - 1 = 199.
+        assert_eq!(
+            calls[1], 199,
+            "second call must advance past oldest of previous page"
+        );
+
+        // All candles ≥ start are present, none below.
+        assert!(result.iter().all(|c| c.time >= 100));
+        assert!(result.iter().any(|c| c.time == 100));
+        assert!(result.iter().any(|c| c.time == 300));
+    }
+
+    #[tokio::test]
+    async fn get_k_range_filters_to_start_on_final_page() {
+        // Final page contains candles before the start; they must be dropped.
+        let page1 = vec![k(80), k(60), k(40)]; // all < range.start=50 → drop 40
+        let provider = FakeProvider::new(vec![page1]);
+
+        let result = get_k_range(&provider, "ANY", Level::Hour4, 50u64..=100u64)
+            .await
+            .unwrap();
+
+        assert!(result.iter().all(|c| c.time >= 50));
+        assert!(!result.iter().any(|c| c.time == 40));
+    }
+
+    #[tokio::test]
+    async fn get_k_range_handles_empty_first_page() {
+        let provider = FakeProvider::new(vec![Vec::new()]);
+        let result = get_k_range(&provider, "ANY", Level::Hour4, 0u64..=10u64)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_k_range_uses_explicit_inclusive_end() {
+        let provider = FakeProvider::new(vec![vec![k(20), k(15), k(10)]]);
+        let _ = get_k_range(&provider, "ANY", Level::Hour4, 10u64..=20u64)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.calls()[0],
+            20,
+            "RangeInclusive end must be passed through unchanged"
+        );
     }
 }
