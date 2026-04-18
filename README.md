@@ -148,5 +148,3 @@ Sample run on the cached `BTC-USDT 15m` data (2019-01-01 → 2024-05-09, ~187k c
 On this dataset f64 is roughly 1.77× slower than f32 — the sweep is dominated by memory bandwidth (the EMA store grows to ~hundreds of MB), so widening the data words doubles the working set and pushes more traffic through the cache hierarchy. The two precisions select different EMA pairs because the search space is huge and many pairs have very close Sharpe ratios; small rounding differences are enough to tip the ranking.
 
 Treat these numbers as machine- and dataset-specific, not universal benchmark claims.
-
-- `backtest_rust_f16.zip` is best treated as an archived experiment, not part of the current build or documented runtime path.

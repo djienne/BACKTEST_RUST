@@ -6,8 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const INTER_PAGE_DELAY_MS: u64 = 50;
 
 // All variants are kept so the candlestick interval can be selected via
-// configuration. The current binary defaults to Hour4; the rest stay around
-// for any future timeframe selection (env var, CLI flag, or strategy config).
+// configuration. The current binary defaults to Minute15; the rest stay
+// around for any future timeframe selection (env var, CLI flag, or strategy
+// config).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
@@ -129,15 +130,7 @@ impl Binance {
         }
         let symbol = product.replace('-', "");
         let interval = level.as_binance_str();
-
-        let mut query: Vec<(&str, String)> = vec![
-            ("symbol", symbol),
-            ("interval", interval.to_string()),
-            ("limit", "1500".to_string()),
-        ];
-        if time != 0 {
-            query.push(("endTime", (time - 1).to_string()));
-        }
+        let query = build_klines_query(&symbol, interval, time);
 
         let response: serde_json::Value = self
             .client
@@ -170,6 +163,21 @@ impl Binance {
         }
         Ok(result)
     }
+}
+
+/// Build the query parameters for Binance's `/api/v3/klines` endpoint.
+/// `end_time_ms` is treated as **inclusive** to match the Binance API
+/// contract; pass `0` to omit the parameter entirely.
+fn build_klines_query(symbol: &str, interval: &str, end_time_ms: u64) -> Vec<(&'static str, String)> {
+    let mut query: Vec<(&'static str, String)> = vec![
+        ("symbol", symbol.to_string()),
+        ("interval", interval.to_string()),
+        ("limit", "1500".to_string()),
+    ];
+    if end_time_ms != 0 {
+        query.push(("endTime", end_time_ms.to_string()));
+    }
+    query
 }
 
 fn parse_field(
@@ -217,7 +225,10 @@ where
                 }
                 break;
             }
-            end = k.time;
+            // Move past the just-fetched oldest candle so the next page does
+            // not re-fetch it (Binance treats `endTime` as inclusive).
+            // `saturating_sub` guards the unrealistic `k.time == 0` edge.
+            end = k.time.saturating_sub(1);
             result.extend(v);
             tokio::time::sleep(Duration::from_millis(INTER_PAGE_DELAY_MS)).await;
         } else {
@@ -265,6 +276,27 @@ mod tests {
         let range: TimeRange = (..).into();
         assert_eq!(range.start, 0);
         assert_eq!(range.end, None);
+    }
+
+    #[test]
+    fn build_klines_query_includes_inclusive_end_time() {
+        let q = build_klines_query("BTCUSDT", "4h", 1_700_000_000_000);
+        assert!(q.contains(&("symbol", "BTCUSDT".to_string())));
+        assert!(q.contains(&("interval", "4h".to_string())));
+        assert!(q.contains(&("limit", "1500".to_string())));
+        assert!(
+            q.contains(&("endTime", "1700000000000".to_string())),
+            "endTime must be passed through unchanged: {q:?}"
+        );
+    }
+
+    #[test]
+    fn build_klines_query_omits_end_time_when_zero() {
+        let q = build_klines_query("BTCUSDT", "4h", 0);
+        assert!(
+            q.iter().all(|(k, _)| *k != "endTime"),
+            "endTime must be omitted when the caller passes 0: {q:?}"
+        );
     }
 
     #[tokio::test]

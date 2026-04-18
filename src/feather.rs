@@ -33,6 +33,13 @@ fn kline_schema() -> Schema {
 }
 
 /// Write `candles` to `path` as a single-batch Feather v2 file.
+///
+/// Atomic on success: the bytes are written to `<path>.tmp` first and then
+/// renamed over `path`. A crash mid-write leaves either the previous file
+/// intact (if `<path>.tmp` was never renamed) or no `.tmp` leftover (if the
+/// helper itself returned an error). `fs::rename` is atomic on Windows
+/// (`MoveFileExW MOVEFILE_REPLACE_EXISTING`) and POSIX when source and
+/// destination are on the same filesystem — the common case here.
 pub fn write(path: &Path, candles: &[K]) -> Result<()> {
     let schema = Arc::new(kline_schema());
 
@@ -54,21 +61,44 @@ pub fn write(path: &Path, candles: &[K]) -> Result<()> {
     )
     .context("failed to build RecordBatch for kline cache")?;
 
-    let file = File::create(path)
-        .with_context(|| format!("failed to create feather file: {}", path.display()))?;
+    let tmp = tmp_path(path);
+    let result = write_batch_to(&tmp, &schema, &batch);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to rename {} → {}",
+                tmp.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    std::path::PathBuf::from(s)
+}
+
+fn write_batch_to(tmp: &Path, schema: &Arc<Schema>, batch: &RecordBatch) -> Result<()> {
+    let file = File::create(tmp)
+        .with_context(|| format!("failed to create temp feather file: {}", tmp.display()))?;
     let writer = BufWriter::new(file);
     let mut writer = FileWriter::try_new(writer, schema.as_ref()).with_context(|| {
-        format!(
-            "failed to construct feather writer for {}",
-            path.display()
-        )
-    })?;
-    writer.write(&batch).with_context(|| {
-        format!("failed to write RecordBatch to {}", path.display())
+        format!("failed to construct feather writer for {}", tmp.display())
     })?;
     writer
+        .write(batch)
+        .with_context(|| format!("failed to write RecordBatch to {}", tmp.display()))?;
+    writer
         .finish()
-        .with_context(|| format!("failed to finalize feather file {}", path.display()))?;
+        .with_context(|| format!("failed to finalize feather file {}", tmp.display()))?;
     Ok(())
 }
 
@@ -114,10 +144,11 @@ pub fn read_last_time(path: &Path) -> Result<u64> {
         if time.is_empty() {
             continue;
         }
-        // Candles inside the cache are stored ascending by time (load_k_lines
-        // normalizes), so the last value of the last batch is the max. Fall
-        // back to a scan if any value disagrees, defending against an
-        // out-of-order file.
+        // The Feather file is written sorted ascending by `load_k_lines` and
+        // `download_dump_k_lines`, so the last value of the last batch is the
+        // max. We still take `max(scanned, last)` as a defensive insurance
+        // against a manually-produced out-of-order file. The scan is a single
+        // u64 column — microseconds even on hundreds of thousands of rows.
         let last = time.value(time.len() - 1);
         let scanned_max = (0..time.len())
             .map(|i| time.value(i))
@@ -140,14 +171,19 @@ fn validate_schema(actual: &Schema, path: &Path) -> Result<()> {
         ));
     }
     for (got, want) in actual.fields().iter().zip(expected.fields().iter()) {
-        if got.name() != want.name() || got.data_type() != want.data_type() {
+        if got.name() != want.name()
+            || got.data_type() != want.data_type()
+            || got.is_nullable() != want.is_nullable()
+        {
             return Err(anyhow!(
-                "{}: schema mismatch — expected `{}: {:?}`, got `{}: {:?}`",
+                "{}: schema mismatch — expected `{}: {:?}` (nullable={}), got `{}: {:?}` (nullable={})",
                 path.display(),
                 want.name(),
                 want.data_type(),
+                want.is_nullable(),
                 got.name(),
                 got.data_type(),
+                got.is_nullable(),
             ));
         }
     }
@@ -304,6 +340,82 @@ mod tests {
         let path = temp_path("garbage");
         std::fs::write(&path, b"not an arrow file").unwrap();
         assert!(read(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_overwrites_existing_target_atomically() {
+        let path = temp_path("overwrite");
+        let first = sample(20);
+        let second = sample(5);
+        write(&path, &first).unwrap();
+        write(&path, &second).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back, second, "second write must replace the first");
+        let tmp = tmp_path(&path);
+        assert!(!tmp.exists(), "no .tmp leftover after success");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_cleans_up_temp_when_target_dir_missing() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "backtest_rust_no_dir_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ))
+            .join("nope")
+            .join("missing.feather");
+        assert!(write(&path, &sample(3)).is_err());
+        let tmp = tmp_path(&path);
+        assert!(!tmp.exists(), "no .tmp leftover when write fails");
+    }
+
+    #[test]
+    fn read_rejects_nullable_schema() {
+        use arrow::ipc::writer::FileWriter;
+        let path = temp_path("nullable");
+        // Build a schema with a nullable `time` column — different from what
+        // `kline_schema()` produces.
+        let bad_schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::UInt64, true),
+            Field::new("open", DataType::Float32, false),
+            Field::new("high", DataType::Float32, false),
+            Field::new("low", DataType::Float32, false),
+            Field::new("close", DataType::Float32, false),
+        ]));
+        let candles = sample(3);
+        let time = UInt64Array::from_iter_values(candles.iter().map(|k| k.time));
+        let open = Float32Array::from_iter_values(candles.iter().map(|k| k.open));
+        let high = Float32Array::from_iter_values(candles.iter().map(|k| k.high));
+        let low = Float32Array::from_iter_values(candles.iter().map(|k| k.low));
+        let close = Float32Array::from_iter_values(candles.iter().map(|k| k.close));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&bad_schema),
+            vec![
+                Arc::new(time),
+                Arc::new(open),
+                Arc::new(high),
+                Arc::new(low),
+                Arc::new(close),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = FileWriter::try_new(file, bad_schema.as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+
+        let err = read(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nullable"),
+            "expected nullability complaint, got: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

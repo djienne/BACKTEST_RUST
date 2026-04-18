@@ -10,9 +10,12 @@ fn synthetic_market(n: usize) -> CandleSeries {
     for i in 0..n {
         timestamps.push(i as u64 * 60_000);
         let phase = (i as f32 / 30.0).sin();
-        let price = 100.0 + 20.0 * phase;
-        open_prices.push(price);
-        close_prices.push(price);
+        let close = 100.0 + 20.0 * phase;
+        // Open shifted by a small constant so swapping `open_prices` and
+        // `close_prices` in the execution path would observably change
+        // the computed best result.
+        open_prices.push(close + 0.5);
+        close_prices.push(close);
     }
     CandleSeries {
         timestamps,
@@ -41,22 +44,11 @@ fn small_config() -> RunConfig {
 #[test]
 fn run_is_deterministic_on_synthetic_market() {
     let market = synthetic_market(200);
-    let report1 = run(small_config(), &market).unwrap();
-    let report2 = run(small_config(), &market).unwrap();
+    let r1 = run(small_config(), &market).unwrap();
+    let r2 = run(small_config(), &market).unwrap();
 
-    assert_eq!(report1.selected.precision, ACTIVE_PRECISION);
-    assert_eq!(
-        report1.selected.best.fast_period,
-        report2.selected.best.fast_period
-    );
-    assert_eq!(
-        report1.selected.best.slow_period,
-        report2.selected.best.slow_period
-    );
-    assert!(
-        (report1.selected.best.metrics.sharpe_ratio
-            - report2.selected.best.metrics.sharpe_ratio)
-            .abs()
-            < 1e-9
-    );
+    assert_eq!(r1.precision, ACTIVE_PRECISION);
+    assert_eq!(r1.best.fast_period, r2.best.fast_period);
+    assert_eq!(r1.best.slow_period, r2.best.slow_period);
+    assert!((r1.best.metrics.sharpe_ratio - r2.best.metrics.sharpe_ratio).abs() < 1e-9);
 }

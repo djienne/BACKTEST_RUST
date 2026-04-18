@@ -67,11 +67,6 @@ pub struct PrecisionRun {
     pub duration: Duration,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RunReport {
-    pub selected: PrecisionRun,
-}
-
 pub fn periods_per_year(level: Level) -> usize {
     match level {
         Level::Minute1 => 24 * 60 * 365,
@@ -169,6 +164,7 @@ pub fn backtest_double_ema<T: BacktestFloat>(
     let mut usdt: T = config.starting_capital;
     let mut asset_quantity: T = T::ZERO;
     let mut in_position = false;
+    let mut previous_value: T = usdt;
 
     let mut portfolio_values = Vec::with_capacity(close_prices.len());
     portfolio_values.push(usdt);
@@ -177,7 +173,6 @@ pub fn backtest_double_ema<T: BacktestFloat>(
     for i in 1..close_prices.len() {
         let trade_price = entry_price(config.execution_model, open_prices, i);
         let mark_price = close_prices[i];
-        let previous_value = portfolio_values.last().copied().unwrap();
         let previous_fast = ema1[i - 1];
         let previous_slow = ema2[i - 1];
 
@@ -201,6 +196,7 @@ pub fn backtest_double_ema<T: BacktestFloat>(
         if previous_value > T::ZERO {
             returns.push((current_value - previous_value) / previous_value);
         }
+        previous_value = current_value;
     }
 
     let final_value = portfolio_values.last().copied().unwrap().to_f64();
@@ -224,20 +220,19 @@ fn run_precision_sweep_impl<T: BacktestFloat>(
     config: &RunConfig,
     open_prices: &[T],
     close_prices: &[T],
-    precision: Precision,
     show_progress: bool,
     parameter_pairs: &[(usize, usize)],
 ) -> anyhow::Result<PrecisionRun> {
-    println!("Calculating all indicators for {}...", precision);
+    println!("Calculating all indicators for {}...", ACTIVE_PRECISION);
     let ema_store =
         ta_wrapper::EMAStore::<T>::new(close_prices, config.fast_period_min, config.max_period);
     let backtest_config = numeric_backtest_config::<T>(config);
 
-    println!("Calculated all indicators for {}.", precision);
+    println!("Calculated all indicators for {}.", ACTIVE_PRECISION);
     if show_progress {
         println!(
             "Running all backtests on {} threads with {}...",
-            config.threads, precision
+            config.threads, ACTIVE_PRECISION
         );
     }
 
@@ -286,7 +281,7 @@ fn run_precision_sweep_impl<T: BacktestFloat>(
         .with_context(|| "EMA parameter search space is empty")?;
 
     Ok(PrecisionRun {
-        precision,
+        precision: ACTIVE_PRECISION,
         best,
         duration: start.elapsed(),
     })
@@ -302,7 +297,7 @@ fn to_active_floats(prices: &[f32]) -> Vec<Float> {
     prices.iter().copied().map(f64::from).collect()
 }
 
-pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<RunReport> {
+pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<PrecisionRun> {
     let pool = ThreadPoolBuilder::new()
         .num_threads(config.threads)
         .build()
@@ -317,17 +312,14 @@ pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<RunReport
     let open = to_active_floats(&market.open_prices);
     let close = to_active_floats(&market.close_prices);
 
-    let selected = run_precision_sweep_impl::<Float>(
+    run_precision_sweep_impl::<Float>(
         &pool,
         &config,
         &open,
         &close,
-        ACTIVE_PRECISION,
         config.show_progress,
         &parameter_pairs,
-    )?;
-
-    Ok(RunReport { selected })
+    )
 }
 
 #[cfg(test)]
@@ -355,6 +347,39 @@ mod tests {
         );
 
         assert!((metrics.final_value - 499.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn backtest_enters_then_exits_on_crossover_reversal() {
+        // 6 bars, all open=close=100. EMAs cross above slow at i=2 (signal
+        // from EMA[1]=(2,1)) → enter at open[2]. They cross below slow at
+        // i=5 (signal from EMA[4]=(1,2)) → exit at open[5].
+        let open_prices = vec![100.0_f32; 6];
+        let close_prices = vec![100.0_f32; 6];
+        let ema_fast = vec![f32::NAN, 2.0, 2.0, 2.0, 1.0, 1.0];
+        let ema_slow = vec![f32::NAN, 1.0, 1.0, 1.0, 2.0, 2.0];
+
+        let metrics = backtest_double_ema(
+            &open_prices,
+            &close_prices,
+            &ema_fast,
+            &ema_slow,
+            NumericBacktestConfig {
+                periods_per_year: periods_per_year(Level::Hour4),
+                starting_capital: 1000.0_f32,
+                fee_rate: 0.0015_f32,
+                execution_model: ExecutionModel::NextOpen,
+            },
+        );
+
+        // Round-trip cost: 1000 * (1 - fee)^2 = 1000 * 0.9985 * 0.9985.
+        let expected = 1000.0_f64 * (1.0 - 0.0015_f64).powi(2);
+        assert!(
+            (metrics.final_value - expected).abs() < 1e-3,
+            "final_value = {}, expected ≈ {}",
+            metrics.final_value,
+            expected
+        );
     }
 
     #[test]

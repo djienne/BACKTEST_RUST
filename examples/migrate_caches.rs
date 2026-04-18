@@ -7,7 +7,8 @@ use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 
 const PAIR: &str = "BTC-USDT";
-const SINCE_MS: u64 = 1_546_300_800_000; // 2019-01-01T00:00:00Z
+// 2019-01-01T00:00:00Z (UTC), in milliseconds since the unix epoch.
+const SINCE_MS: u64 = 1_546_300_800_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

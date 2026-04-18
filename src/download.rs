@@ -120,13 +120,25 @@ fn interval_check(v: &[K]) -> (bool, u64) {
 /// file is treated as the source of truth).
 pub fn migrate_legacy_json(legacy: &Path, target: &Path) -> Result<()> {
     if target.exists() {
-        if let Err(error) = fs::remove_file(legacy) {
-            eprintln!(
-                "Warning: failed to remove obsolete legacy cache {}: {error}",
-                legacy.display()
-            );
+        // Probe the target for a valid Feather IPC footer before treating it
+        // as the source of truth. A corrupt or truncated `.feather` (e.g.
+        // from a crashed write predating atomic rename) would otherwise be
+        // blessed silently while the only good copy — the legacy JSON — is
+        // deleted. If the probe fails, fall through to the conversion path.
+        if feather::read_last_time(target).is_ok() {
+            if let Err(error) = fs::remove_file(legacy) {
+                eprintln!(
+                    "Warning: failed to remove obsolete legacy cache {}: {error}",
+                    legacy.display()
+                );
+            }
+            return Ok(());
         }
-        return Ok(());
+        eprintln!(
+            "Note: target {} exists but failed validation; rebuilding from legacy {}.",
+            target.display(),
+            legacy.display(),
+        );
     }
     let contents = fs::read_to_string(legacy)
         .with_context(|| format!("failed to read legacy cache {}", legacy.display()))?;
@@ -482,6 +494,25 @@ mod tests {
         assert!(!legacy.exists(), "stale json should be cleaned up");
         let back = feather::read(&target).unwrap();
         assert_eq!(back, feather_candles, "target must not be overwritten");
+        let _ = fs::remove_file(&target);
+    }
+
+    #[test]
+    fn migrate_legacy_json_recovers_from_corrupt_target() {
+        let legacy = unique_temp("migrate_corrupt_target", "json");
+        let target = unique_temp("migrate_corrupt_target", "feather");
+        let candles = small_klines(&[7, 8, 9]);
+        fs::write(&legacy, serde_json::to_string(&candles).unwrap()).unwrap();
+        // Pre-write garbage as the "existing" target — simulates a corrupt
+        // cache from a crashed write before atomic rename was added.
+        fs::write(&target, b"garbage feather bytes").unwrap();
+
+        migrate_legacy_json(&legacy, &target).expect("migration recovers");
+
+        assert!(!legacy.exists(), "legacy json should be removed after rebuild");
+        let back = feather::read(&target).expect("target now valid feather");
+        assert_eq!(back, candles);
+
         let _ = fs::remove_file(&target);
     }
 

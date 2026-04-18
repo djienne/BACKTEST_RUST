@@ -27,11 +27,14 @@ pub fn results_file_path(pair: &str, level: &Level) -> PathBuf {
 
 pub fn load_data_file(pair: &str, level: &Level) -> Result<CandleSeries> {
     let k_v = load_k_lines(pair, level)?;
-
-    let timestamps = k_v.iter().map(|k| k.time).collect();
-    let open_prices = k_v.iter().map(|k| k.open).collect();
-    let close_prices = k_v.iter().map(|k| k.close).collect();
-
+    let mut timestamps = Vec::with_capacity(k_v.len());
+    let mut open_prices = Vec::with_capacity(k_v.len());
+    let mut close_prices = Vec::with_capacity(k_v.len());
+    for k in &k_v {
+        timestamps.push(k.time);
+        open_prices.push(k.open);
+        close_prices.push(k.close);
+    }
     Ok(CandleSeries {
         timestamps,
         open_prices,

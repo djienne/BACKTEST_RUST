@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use backtest_rust::backtest::{run, ExecutionModel, RunConfig, RunReport};
+use backtest_rust::backtest::{run, ExecutionModel, RunConfig};
 use backtest_rust::data::{data_file_path, load_data_file, results_file_path};
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
@@ -91,7 +91,7 @@ where
     while let Some(arg) = iter.next() {
         match arg.as_ref() {
             "download" => mode = RunMode::DownloadOnly,
-            "--force" | "--force-download" => force_download = true,
+            "--force" => force_download = true,
             "--since" => {
                 let value = iter
                     .next()
@@ -113,11 +113,11 @@ fn print_usage() {
     println!(
         "Usage: backtest_rust [SUBCOMMAND] [OPTIONS]\n\n\
          Subcommands:\n  \
-           download           Download historical klines, then exit (no sweep)\n\n\
+           download         Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n\n\
          Options:\n  \
-           --force, --force-download   Bypass the freshness guard and re-download\n  \
-           --since <DATE|MS>           Override download start (YYYY-MM-DD or unix-ms)\n  \
-           -h, --help                  Show this message\n\n\
+           --force          Bypass the freshness guard and re-download\n  \
+           --since <DATE|MS>   Override download start (YYYY-MM-DD or unix-ms)\n  \
+           -h, --help       Show this message\n\n\
          Environment variables:\n  \
            BACKTEST_SHOW_PROGRESS=0|1   Toggle per-iteration progress log\n  \
            BACKTEST_FORCE_DOWNLOAD=0|1  Alternative to --force for the default mode"
@@ -163,15 +163,16 @@ async fn main() -> anyhow::Result<()> {
 
     let data_file = data_file_path(config.pair, &config.level);
 
+    let download_result = download_dump_k_lines(
+        config.pair,
+        config.level,
+        config.download_start..,
+        force,
+    )
+    .await;
+
     if cli.mode == RunMode::DownloadOnly {
-        download_dump_k_lines(
-            config.pair,
-            config.level,
-            config.download_start..,
-            force,
-        )
-        .await
-        .with_context(|| {
+        download_result.with_context(|| {
             format!(
                 "failed to download market data for {} {}",
                 config.pair, config.level
@@ -182,14 +183,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Err(error) = download_dump_k_lines(
-        config.pair,
-        config.level,
-        config.download_start..,
-        force,
-    )
-    .await
-    {
+    if let Err(error) = download_result {
         if !data_file.is_file() {
             return Err(error).with_context(|| {
                 format!(
@@ -204,12 +198,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    println!("Doing: {:} {:}", config.pair, config.level);
+    println!("Doing: {} {}", config.pair, config.level);
     let market = load_data_file(config.pair, &config.level)?;
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
-    let RunReport { selected } = run(config, &market)?;
+    let selected = run(config, &market)?;
 
     println!("Done");
     println!("Precision: {}", selected.precision);
@@ -226,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("Sweep duration: {:.3}s", selected.duration.as_secs_f64());
 
-    let ohlcv_file = format!("{}_{}", config.pair, config.level);
+    let ohlcv_file = format!("{}-{}", config.pair, config.level);
     let precision = selected.precision.to_string();
     write_to_file(
         &results_file_path(config.pair, &config.level),
@@ -275,7 +269,7 @@ mod tests {
     #[test]
     fn parse_cli_args_reads_force_flag() {
         assert!(parse_cli_args(["--force"]).unwrap().force_download);
-        assert!(parse_cli_args(["--force-download"]).unwrap().force_download);
+        assert!(parse_cli_args(["--force-download"]).is_err());
     }
 
     #[test]
