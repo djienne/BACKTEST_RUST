@@ -1,8 +1,10 @@
 //! Can be implemented using recursion, but this may cause a stack overflow, so it is fully implemented using a Vec instead.
 
 use crate::*;
+#[cfg(test)]
 use chrono::TimeZone;
 
+#[cfg(test)]
 pub fn yield_map<'a, F>(source: &'a Source, f: F) -> impl Iterator<Item = f32> + 'a
 where
     F: FnMut(&Source) -> f32 + 'a,
@@ -10,6 +12,7 @@ where
     source.iter().enumerate().map(|v| &source[v.0..]).map(f)
 }
 
+#[cfg(test)]
 pub fn yield_nan<F>(source: &Source, mut f: F) -> f32
 where
     F: FnMut(f32, &Source) -> f32,
@@ -25,6 +28,7 @@ where
     result
 }
 
+#[cfg(test)]
 pub fn highest(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -41,6 +45,7 @@ pub fn highest(source: &Source, length: usize) -> f32 {
     result
 }
 
+#[cfg(test)]
 pub fn highest_index(source: &Source, length: usize) -> Option<usize> {
     if source.len() < length {
         return None;
@@ -59,6 +64,7 @@ pub fn highest_index(source: &Source, length: usize) -> Option<usize> {
     Some(index)
 }
 
+#[cfg(test)]
 pub fn lowest(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -75,6 +81,7 @@ pub fn lowest(source: &Source, length: usize) -> f32 {
     result
 }
 
+#[cfg(test)]
 pub fn lowest_index(source: &Source, length: usize) -> Option<usize> {
     if source.len() < length {
         return None;
@@ -93,6 +100,7 @@ pub fn lowest_index(source: &Source, length: usize) -> Option<usize> {
     Some(index)
 }
 
+#[cfg(test)]
 pub fn sma(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -101,6 +109,7 @@ pub fn sma(source: &Source, length: usize) -> f32 {
     source.iter().take(length).sum::<f32>() / length as f32
 }
 
+#[cfg(test)]
 pub fn ema(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -117,6 +126,7 @@ pub fn ema(source: &Source, length: usize) -> f32 {
     })
 }
 
+#[cfg(test)]
 pub fn rma(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -133,6 +143,7 @@ pub fn rma(source: &Source, length: usize) -> f32 {
     })
 }
 
+#[cfg(test)]
 pub fn cci(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -143,6 +154,7 @@ pub fn cci(source: &Source, length: usize) -> f32 {
     (source - ma) / (0.015f32 * (sum / length as f32))
 }
 
+#[cfg(test)]
 pub fn macd(
     source: &Source,
     short_length: usize,
@@ -166,6 +178,7 @@ pub fn macd(
     (dif, dea, macd)
 }
 
+#[cfg(test)]
 pub fn rsi(source: &Source, length: usize) -> f32 {
     if source.len() < length {
         return f32::NAN;
@@ -195,6 +208,7 @@ pub fn rsi(source: &Source, length: usize) -> f32 {
 ///
 /// * `source`: Data series.
 /// * `value`: Value.
+#[cfg(test)]
 pub fn crossover(source: &Source, value: f32) -> bool {
     source > value && source[1] <= value
 }
@@ -205,6 +219,7 @@ pub fn crossover(source: &Source, value: f32) -> bool {
 /// * `source`: Data series.
 /// * `value`: Value.
 /// * `f`: Mapping function.
+#[cfg(test)]
 pub fn crossover_map<F>(source: &Source, value: f32, mut f: F) -> bool
 where
     F: FnMut(&Source) -> f32,
@@ -218,6 +233,7 @@ where
 /// * `source`: Data series.
 /// * `value`: Value.
 /// * `f`: Mapping function.
+#[cfg(test)]
 pub fn crossunder(source: &Source, value: f32) -> bool {
     source < value && source[1] >= value
 }
@@ -228,6 +244,7 @@ pub fn crossunder(source: &Source, value: f32) -> bool {
 /// * `source`: Data series.
 /// * `value`: Value.
 /// * `f`: Mapping function.
+#[cfg(test)]
 pub fn crossunder_map<F>(source: &Source, value: f32, mut f: F) -> bool
 where
     F: FnMut(&Source) -> f32,
@@ -244,10 +261,12 @@ fn utc_datetime_from_millis(value: u64) -> chrono::DateTime<chrono::Utc> {
         .unwrap_or_else(|| panic!("invalid timestamp millis: {value}"))
 }
 
+#[cfg(test)]
 fn naive_datetime_from_millis(value: u64) -> chrono::NaiveDateTime {
     utc_datetime_from_millis(value).naive_utc()
 }
 
+#[cfg(test)]
 fn naive_datetime_to_millis(value: chrono::NaiveDateTime) -> u64 {
     value.and_utc().timestamp_millis() as u64
 }
@@ -263,6 +282,7 @@ pub fn time_to_string(value: u64) -> String {
 ///
 /// * `value`: Local time text.
 /// * `return`: Timestamp.
+#[cfg(test)]
 pub fn string_to_time<S>(value: S) -> u64
 where
     S: AsRef<str>,
@@ -357,6 +377,7 @@ where
 /// * `range`: Time range, where 0 indicates fetching all data, and a..b specifies data within the timestamp range from a to b,
 /// * `millis`: Milliseconds of delay.
 /// * `return`: Candlestick array, with newer data at the front.
+#[cfg(test)]
 pub async fn get_k_range_sleep<E, S, T>(
     exchange: &E,
     product: S,
@@ -432,6 +453,7 @@ where
 /// * `time`: Candlestick timestamp.
 /// * `level`: The time level to convert to.
 /// * `return`: The timestamp for the current candlestick, and the timestamp for the next candlestick.
+#[cfg(test)]
 pub fn k_time_convert(time: u64, level: Level) -> (u64, u64) {
     match level {
         Level::Minute1 => (time, time + 1000 * 60),
@@ -617,6 +639,7 @@ pub fn k_time_convert(time: u64, level: Level) -> (u64, u64) {
 /// * `array`: Candlestick array, with newer data at the front.
 /// * `level`: The time level to convert to, which must be greater than or equal to the candlestick's time level.
 /// * `return`: Candlestick array, with newer data at the front.
+#[cfg(test)]
 pub fn k_convert<T>(array: T, level: Level) -> Vec<K>
 where
     T: AsRef<[K]>,
@@ -684,10 +707,12 @@ where
 }
 
 /// Quickly calculate EMA.
+#[cfg(test)]
 pub struct EMACache {
     last: f32,
 }
 
+#[cfg(test)]
 impl EMACache {
     pub fn new() -> Self {
         Self { last: f32::NAN }
@@ -714,10 +739,12 @@ impl EMACache {
 }
 
 /// Quickly calculate RMA.
+#[cfg(test)]
 pub struct RMACache {
     last: f32,
 }
 
+#[cfg(test)]
 impl RMACache {
     pub fn new() -> Self {
         Self { last: f32::NAN }
@@ -744,6 +771,7 @@ impl RMACache {
 }
 
 /// Quickly calculate MACD.
+#[cfg(test)]
 pub struct MACDCache {
     short_ema: EMACache,
     long_ema: EMACache,
@@ -751,6 +779,7 @@ pub struct MACDCache {
     dea: std::collections::VecDeque<f32>,
 }
 
+#[cfg(test)]
 impl MACDCache {
     pub fn new() -> Self {
         Self {
@@ -789,6 +818,7 @@ impl MACDCache {
 }
 
 /// Quickly calculate RSI.
+#[cfg(test)]
 pub struct RSICache {
     u: std::collections::VecDeque<f32>,
     d: std::collections::VecDeque<f32>,
@@ -796,6 +826,7 @@ pub struct RSICache {
     d_rma: RMACache,
 }
 
+#[cfg(test)]
 impl RSICache {
     pub fn new() -> Self {
         Self {

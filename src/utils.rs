@@ -1,26 +1,14 @@
 use super::auto_trading::*;
 use anyhow::{Context, Result};
 use chrono::prelude::*; // This crate provides easy-to-use date and time functions
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
 use std::{
     fs::File,
     fs::OpenOptions,
-    io::BufReader,
     path::{Path, PathBuf},
 };
-
-#[derive(Serialize, Deserialize)]
-pub struct MarketData {
-    timestamp: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandleSeries {
@@ -146,36 +134,6 @@ pub fn write_to_file(
     )?;
 
     writer.flush() // Make sure to flush the buffer
-}
-
-pub fn load_market_data(filepath: impl AsRef<Path>) -> Result<Vec<MarketData>> {
-    let file = File::open(filepath.as_ref())
-        .with_context(|| format!("Failed to open file: {:?}", filepath.as_ref()))?;
-    let reader = BufReader::new(file);
-    let data = serde_json::from_reader(reader).with_context(|| "Failed to parse JSON data")?;
-    Ok(data)
-}
-
-pub fn extract_fields(data: &[MarketData]) -> (Vec<i64>, Vec<f64>) {
-    let timestamps = data.iter().map(|entry| entry.timestamp).collect();
-    let close_prices = data.iter().map(|entry| entry.close).collect();
-    (timestamps, close_prices)
-}
-
-pub fn get_filename(path_str: &str) -> &str {
-    let path = Path::new(path_str);
-
-    if let Some(stem) = path.file_stem() {
-        if let Some(stem_str) = stem.to_str() {
-            stem_str
-        } else {
-            println!("File stem contains invalid UTF-8 characters.");
-            "error"
-        }
-    } else {
-        println!("No base name found in the path.");
-        "error"
-    }
 }
 
 pub fn load_k_lines(pair: &str, level: &Level) -> Result<Vec<K>> {

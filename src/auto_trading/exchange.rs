@@ -18,6 +18,7 @@ pub trait Exchange {
     ///
     /// * `product`: Trading product, for example, spot BTC-USDT, futures contract BTC-USDT-SWAP.
     /// * `return`: In units of the currency.
+    #[cfg(test)]
     async fn get_min_size<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,
@@ -27,6 +28,7 @@ pub trait Exchange {
     ///
     /// * `product`: Trading product, for example, spot BTC-USDT, futures contract BTC-USDT-SWAP.
     /// * `return`: In units of fiat currency, returns 0 if the exchange does not specify.
+    #[cfg(test)]
     async fn get_min_notional<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,
@@ -42,6 +44,7 @@ fn value_array<'a>(
         .ok_or_else(|| anyhow::anyhow!("{context}: expected array, got {value}"))
 }
 
+#[cfg(test)]
 fn object_array_field<'a>(
     value: &'a serde_json::Value,
     field: &str,
@@ -53,6 +56,7 @@ fn object_array_field<'a>(
         .ok_or_else(|| anyhow::anyhow!("{context}: missing or invalid '{field}' field in {value}"))
 }
 
+#[cfg(test)]
 fn object_str_field<'a>(
     value: &'a serde_json::Value,
     field: &str,
@@ -64,6 +68,7 @@ fn object_str_field<'a>(
         .ok_or_else(|| anyhow::anyhow!("{context}: missing or invalid '{field}' field in {value}"))
 }
 
+#[cfg(test)]
 fn parse_object_f32(value: &serde_json::Value, field: &str, context: &str) -> anyhow::Result<f32> {
     object_str_field(value, field, context)?
         .parse::<f32>()
@@ -71,11 +76,13 @@ fn parse_object_f32(value: &serde_json::Value, field: &str, context: &str) -> an
 }
 
 /// Local Exchange.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct LocalExchange {
     inner: Vec<(String, Level, Vec<K>, f32, f32)>,
 }
 
+#[cfg(test)]
 impl LocalExchange {
     pub fn new() -> Self {
         Self { inner: Vec::new() }
@@ -110,6 +117,7 @@ impl LocalExchange {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Deref for LocalExchange {
     type Target = Vec<(String, Level, Vec<K>, f32, f32)>;
 
@@ -118,12 +126,14 @@ impl std::ops::Deref for LocalExchange {
     }
 }
 
+#[cfg(test)]
 impl std::ops::DerefMut for LocalExchange {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl Exchange for LocalExchange {
     async fn get_k<S>(&self, product: S, level: Level, time: u64) -> anyhow::Result<Vec<K>>
@@ -176,12 +186,14 @@ impl Exchange for LocalExchange {
 }
 
 /// OKEx.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct Okx {
     client: reqwest::Client,
     base_url: String,
 }
 
+#[cfg(test)]
 impl Okx {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Self {
@@ -192,6 +204,7 @@ impl Okx {
         })
     }
 
+    #[cfg(test)]
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -199,6 +212,7 @@ impl Okx {
         }
     }
 
+    #[cfg(test)]
     pub fn base_url<S>(mut self, base_url: S) -> Self
     where
         S: AsRef<str>,
@@ -208,6 +222,7 @@ impl Okx {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl Exchange for Okx {
     async fn get_k<S>(&self, product: S, level: Level, time: u64) -> anyhow::Result<Vec<K>>
@@ -334,6 +349,7 @@ impl Exchange for Okx {
         Ok(result)
     }
 
+    #[cfg(test)]
     async fn get_min_size<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,
@@ -380,6 +396,7 @@ impl Exchange for Okx {
         })
     }
 
+    #[cfg(test)]
     async fn get_min_notional<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,
@@ -407,6 +424,7 @@ impl Binance {
         })
     }
 
+    #[cfg(test)]
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -414,6 +432,7 @@ impl Binance {
         }
     }
 
+    #[cfg(test)]
     pub fn base_url<S>(mut self, base_url: S) -> Self
     where
         S: AsRef<str>,
@@ -570,6 +589,7 @@ impl crate::Exchange for Binance {
         Ok(result)
     }
 
+    #[cfg(test)]
     async fn get_min_size<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,
@@ -623,6 +643,7 @@ impl crate::Exchange for Binance {
         parse_object_f32(lot_size, "minQty", "binance LOT_SIZE filter")
     }
 
+    #[cfg(test)]
     async fn get_min_notional<S>(&self, product: S) -> anyhow::Result<f32>
     where
         S: AsRef<str>,

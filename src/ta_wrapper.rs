@@ -28,6 +28,7 @@ pub fn calculate_ema(close_prices: &[f32], period: usize) -> Vec<f32> {
 }
 
 /// Calculate the Relative Strength Index (RSI)
+#[cfg(test)]
 pub fn calculate_rsi(close_prices: &[f32], period: usize) -> Vec<f32> {
     let mut rsi_values = vec![f32::NAN; close_prices.len()];
 
@@ -64,6 +65,7 @@ pub fn calculate_rsi(close_prices: &[f32], period: usize) -> Vec<f32> {
     rsi_values
 }
 
+#[cfg(test)]
 fn compute_rsi(average_gain: f32, average_loss: f32) -> f32 {
     if average_loss == 0.0 {
         100.0
@@ -90,26 +92,6 @@ impl EMAStore {
 
     pub fn get_ema(&self, period: usize) -> &[f32] {
         self.emas.get(&period).map(Vec::as_slice).unwrap_or(&[])
-    }
-}
-
-//
-
-pub struct RSIStore {
-    rsis: HashMap<usize, Vec<f32>>,
-}
-
-impl RSIStore {
-    pub fn new(close_prices: &[f32], period_min: usize, period_max: usize) -> Self {
-        let mut rsis = HashMap::new();
-        for period in period_min..=period_max {
-            rsis.insert(period, calculate_rsi(close_prices, period));
-        }
-        RSIStore { rsis }
-    }
-
-    pub fn get_rsi(&self, period: usize) -> &[f32] {
-        self.rsis.get(&period).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 

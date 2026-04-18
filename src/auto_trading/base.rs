@@ -1,4 +1,5 @@
 use crate::*;
+#[cfg(test)]
 use std::ops;
 
 /// Candlestick (K-line) k.
@@ -35,6 +36,7 @@ impl std::fmt::Display for K {
 }
 
 /// Time levels.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
     /// 1 minute.
@@ -104,12 +106,14 @@ impl std::fmt::Display for Level {
 /// Data series.
 /// Out-of-bound index will return f32::NAN.
 /// Out-of-bound slice will return &[].
+#[cfg(test)]
 #[repr(transparent)] // Keep the layout identical to `[f32]` for slice reborrowing.
 #[derive(Debug)]
 pub struct Source {
     pub inner: [f32],
 }
 
+#[cfg(test)]
 impl Source {
     pub fn new(value: &[f32]) -> &Self {
         // SAFETY: `Source` is `#[repr(transparent)]` over `[f32]`, so a slice reference
@@ -125,6 +129,7 @@ impl Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Deref for Source {
     type Target = [f32];
 
@@ -133,12 +138,14 @@ impl std::ops::Deref for Source {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Display for &Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}", self[0]))
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<usize> for Source {
     type Output = f32;
 
@@ -147,6 +154,7 @@ impl std::ops::Index<usize> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::Range<usize>> for Source {
     type Output = Source;
 
@@ -155,6 +163,7 @@ impl std::ops::Index<std::ops::Range<usize>> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::RangeFrom<usize>> for Source {
     type Output = Source;
 
@@ -163,6 +172,7 @@ impl std::ops::Index<std::ops::RangeFrom<usize>> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::RangeTo<usize>> for Source {
     type Output = Source;
 
@@ -171,6 +181,7 @@ impl std::ops::Index<std::ops::RangeTo<usize>> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::RangeFull> for Source {
     type Output = Source;
 
@@ -179,6 +190,7 @@ impl std::ops::Index<std::ops::RangeFull> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::RangeInclusive<usize>> for Source {
     type Output = Source;
 
@@ -187,6 +199,7 @@ impl std::ops::Index<std::ops::RangeInclusive<usize>> for Source {
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<std::ops::RangeToInclusive<usize>> for Source {
     type Output = Source;
 
@@ -195,102 +208,135 @@ impl std::ops::Index<std::ops::RangeToInclusive<usize>> for Source {
     }
 }
 
+#[cfg(test)]
 impl PartialEq<i64> for &Source {
     fn eq(&self, other: &i64) -> bool {
         self[0] == *other as f32
     }
 }
 
+#[cfg(test)]
 impl PartialEq<f32> for &Source {
     fn eq(&self, other: &f32) -> bool {
         self[0] == *other
     }
 }
 
+#[cfg(test)]
 impl PartialEq<[f32]> for Source {
     fn eq(&self, other: &[f32]) -> bool {
         &self.inner == other
     }
 }
 
+#[cfg(test)]
 impl PartialEq for &Source {
     fn eq(&self, other: &Self) -> bool {
         self[0] == other[0]
     }
 }
 
+#[cfg(test)]
 impl PartialOrd<i64> for &Source {
     fn partial_cmp(&self, other: &i64) -> Option<std::cmp::Ordering> {
         self[0].partial_cmp(&(*other as f32))
     }
 }
 
+#[cfg(test)]
 impl PartialOrd<f32> for &Source {
     fn partial_cmp(&self, other: &f32) -> Option<std::cmp::Ordering> {
         self[0].partial_cmp(other)
     }
 }
 
+#[cfg(test)]
 impl PartialOrd<[f32]> for Source {
     fn partial_cmp(&self, other: &[f32]) -> Option<std::cmp::Ordering> {
         self.inner.partial_cmp(other)
     }
 }
 
+#[cfg(test)]
 impl PartialOrd for &Source {
     fn partial_cmp(&self, other: &&Source) -> Option<std::cmp::Ordering> {
         self[0].partial_cmp(&other[0])
     }
 }
 
+#[cfg(test)]
 overload::overload!((a: &Source) + (b: i64) -> f32 { a[0] + b as f32 });
 
+#[cfg(test)]
 overload::overload!((a: &Source) - (b: i64) -> f32 { a[0] - b as f32 });
 
+#[cfg(test)]
 overload::overload!((a: &Source) * (b: i64) -> f32 { a[0] * b as f32 });
 
+#[cfg(test)]
 overload::overload!((a: &Source) / (b: i64) -> f32 { a[0] / b as f32 });
 
+#[cfg(test)]
 overload::overload!((a: &Source) % (b: i64) -> f32 { a[0] % b as f32 });
 
+#[cfg(test)]
 overload::overload!((a: &Source) + (b: f32) -> f32 { a[0] + b });
 
+#[cfg(test)]
 overload::overload!((a: &Source) - (b: f32) -> f32 { a[0] - b });
 
+#[cfg(test)]
 overload::overload!((a: &Source) * (b: f32) -> f32 { a[0] * b });
 
+#[cfg(test)]
 overload::overload!((a: &Source) / (b: f32) -> f32 { a[0] / b });
 
+#[cfg(test)]
 overload::overload!((a: &Source) % (b: f32) -> f32 { a[0] % b });
 
+#[cfg(test)]
 overload::overload!((a: i64) + (b: &Source) -> f32 { a as f32 + b[0] });
 
+#[cfg(test)]
 overload::overload!((a: i64) - (b: &Source) -> f32 { a as f32 - b[0] });
 
+#[cfg(test)]
 overload::overload!((a: i64) * (b: &Source) -> f32 { a as f32 * b[0] });
 
+#[cfg(test)]
 overload::overload!((a: i64) / (b: &Source) -> f32 { a as f32 / b[0] });
 
+#[cfg(test)]
 overload::overload!((a: i64) % (b: &Source) -> f32 { a as f32 % b[0] });
 
+#[cfg(test)]
 overload::overload!((a: f32) + (b: &Source) -> f32 { a + b[0] });
 
+#[cfg(test)]
 overload::overload!((a: f32) - (b: &Source) -> f32 { a - b[0] });
 
+#[cfg(test)]
 overload::overload!((a: f32) * (b: &Source) -> f32 { a * b[0] });
 
+#[cfg(test)]
 overload::overload!((a: f32) / (b: &Source) -> f32 { a / b[0] });
 
+#[cfg(test)]
 overload::overload!((a: f32) % (b: &Source) -> f32 { a % b[0] });
 
+#[cfg(test)]
 overload::overload!((a: &Source) + (b: &Source) -> f32 { a[0] + b[0] });
 
+#[cfg(test)]
 overload::overload!((a: &Source) - (b: &Source) -> f32 { a[0] - b[0] });
 
+#[cfg(test)]
 overload::overload!((a: &Source) * (b: &Source) -> f32 { a[0] * b[0] });
 
+#[cfg(test)]
 overload::overload!((a: &Source) / (b: &Source) -> f32 { a[0] / b[0] });
 
+#[cfg(test)]
 overload::overload!((a: &Source) % (b: &Source) -> f32 { a[0] % b[0] });
 
 /// Time range.
@@ -364,6 +410,7 @@ impl From<std::ops::RangeToInclusive<u64>> for TimeRange {
 }
 
 /// Order direction.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     /// Buy to open a long position.
@@ -380,6 +427,7 @@ pub enum Side {
 }
 
 /// Trading record.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Record {
     /// Position direction.
@@ -408,6 +456,7 @@ pub struct Record {
 }
 
 /// Position.
+#[cfg(test)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Position {
     /// Trading product, for example, spot BTC-USDT, futures contract BTC-USDT-SWAP.
@@ -454,6 +503,7 @@ pub struct Position {
 }
 
 /// Order.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delegate {
     /// Position direction.
@@ -473,6 +523,7 @@ pub struct Delegate {
 }
 
 /// Order Status.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DelegateState {
     /// Single order.
@@ -504,6 +555,7 @@ pub enum DelegateState {
 }
 
 /// Price.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Price {
     /// Greater than or equal to the trigger price, market price.
@@ -520,6 +572,7 @@ pub enum Price {
 }
 
 /// Context environment.
+#[cfg(test)]
 pub struct Context<'a> {
     /// Trading product, for example, spot BTC-USDT, futures contract BTC-USDT-SWAP.
     pub product: &'a str,
@@ -552,6 +605,7 @@ pub struct Context<'a> {
     pub(crate) trading: &'a mut dyn Trading,
 }
 
+#[cfg(test)]
 impl<'a> Context<'a> {
     /// Order.
     /// If the limit price for going long is greater than the market price, then the order will execute only when the price is greater than or equal to the limit price.
@@ -782,6 +836,7 @@ impl<'a> Context<'a> {
 }
 
 /// Trading Interface.
+#[cfg(test)]
 pub trait Trading {
     /// Order.
     /// If the long position limit price is greater than the market price, the order will be executed only when the price is greater than or equal to the limit price.
@@ -842,6 +897,7 @@ pub trait Trading {
 }
 
 /// Quantity, Proportion
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
     /// Ignore.
@@ -855,6 +911,7 @@ pub enum Unit {
 }
 
 /// Trading Configuration.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     pub initial_margin: f32,
@@ -868,6 +925,7 @@ pub struct Config {
     pub max_margin: Unit,
 }
 
+#[cfg(test)]
 impl Config {
     pub fn new() -> Self {
         Config {
