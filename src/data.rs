@@ -11,6 +11,13 @@ pub struct CandleSeries {
 }
 
 pub fn data_file_path(pair: &str, level: &Level) -> PathBuf {
+    Path::new("dataKLines").join(format!("{pair}-{level}.feather"))
+}
+
+/// Path of the legacy JSON cache file for `(pair, level)`. Used by the
+/// one-time migration helper in `download.rs` so existing JSON caches are
+/// converted in place rather than forcing a full re-download.
+pub fn legacy_json_path(pair: &str, level: &Level) -> PathBuf {
     Path::new("dataKLines").join(format!("{pair}-{level}.json"))
 }
 

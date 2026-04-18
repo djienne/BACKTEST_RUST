@@ -1,7 +1,7 @@
 use anyhow::Context as _;
 use backtest_rust::backtest::{run, ExecutionModel, RunConfig, RunReport};
 use backtest_rust::data::{data_file_path, load_data_file, results_file_path};
-use backtest_rust::download::download_dump_k_lines_to_json;
+use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 use backtest_rust::output::{write_to_file, ResultRow};
 use chrono::TimeZone;
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let data_file = data_file_path(config.pair, &config.level);
 
     if cli.mode == RunMode::DownloadOnly {
-        download_dump_k_lines_to_json(
+        download_dump_k_lines(
             config.pair,
             config.level,
             config.download_start..,
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Err(error) = download_dump_k_lines_to_json(
+    if let Err(error) = download_dump_k_lines(
         config.pair,
         config.level,
         config.download_start..,

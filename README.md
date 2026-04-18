@@ -56,10 +56,10 @@ The two features (`f32` and `f64`) are mutually exclusive; the build fails with 
 
 What happens during a normal run:
 
-- The binary looks for `dataKLines/BTC-USDT-15m.json`.
-- Freshness is measured from the **last candle timestamp inside the file**, not the file's mtime. If that last candle is more than two days old (or the file is missing), Binance is queried for a fresh pull. Pass `--force` or set `BACKTEST_FORCE_DOWNLOAD=1` to skip this check.
-- If the download fails but the cache file already exists, it falls back to the cached file.
-- The cache is normalized on load: candles are sorted ascending by timestamp and any duplicate timestamps are dropped. If the file needed fixing, it is rewritten in place and a one-line note is printed to stderr.
+- The binary looks for `dataKLines/BTC-USDT-15m.feather` (Apache Arrow IPC / Feather v2). If only a legacy `.json` cache from a previous version is present, it is auto-migrated to Feather on first load (one-line stderr note).
+- Freshness is measured from the **last candle timestamp inside the file**, not the file's mtime. If that last candle is more than two days old (or the file is missing), Binance is queried for the missing slice only — the existing cache is reused and the API call starts at `last_candle + 1ms`. Pass `--force` or set `BACKTEST_FORCE_DOWNLOAD=1` to bypass the cache and re-download from the configured start date.
+- After the incremental download, the merged candle vector is sorted, deduplicated, and verified to be strictly increasing before being written. A non-uniform interval (e.g., a missing candle) is reported as a warning but not fatal.
+- If the download fails but the cache file already exists, the binary falls back to the cached file.
 - It prints the candle date range, computes indicators, runs the EMA search, and reports the best result.
 - It appends the latest best-result row to `results/BTC-USDT-15m.csv`.
   The CSV includes the active precision (`f32` or `f64`) and the measured sweep duration in milliseconds.
@@ -81,7 +81,7 @@ To pull fresh kline data **without running the sweep**, use the `download` subco
 cargo run --release -- download
 ```
 
-This always re-downloads (bypasses the freshness guard), writes `dataKLines/<pair>-<level>.json`, then exits.
+This always re-downloads (bypasses the freshness guard), writes `dataKLines/<pair>-<level>.feather`, then exits.
 
 Override the start of the window with `--since`. Either a calendar date or a unix-milliseconds timestamp is accepted:
 
@@ -90,7 +90,7 @@ cargo run --release -- download --since 2017-08-17
 cargo run --release -- download --since 1502928000000
 ```
 
-**Maximum available history for BTC-USDT.** Binance's BTC/USDT spot pair started trading on **2017-08-17**, so passing `--since 2017-08-17` (or anything earlier — the API clamps to its own earliest candle) yields the full history Binance will serve for that symbol. Other pairs may have later launch dates; Binance will simply return the earliest candles it has. Note: a full 15-minute history from 2017 is roughly 300k candles and a multi-megabyte JSON file, and the pagination loop adds a small inter-page delay, so an initial full pull takes on the order of a minute.
+**Maximum available history for BTC-USDT.** Binance's BTC/USDT spot pair started trading on **2017-08-17**, so passing `--since 2017-08-17` (or anything earlier — the API clamps to its own earliest candle) yields the full history Binance will serve for that symbol. Other pairs may have later launch dates; Binance will simply return the earliest candles it has. Note: a full 15-minute history from 2017 is roughly 300k candles, and the pagination loop adds a small inter-page delay, so an initial full pull takes on the order of a minute. Subsequent runs only fetch the delta since the last cached candle, so they're effectively free.
 
 Force a re-download inside the normal sweep run with `--force` (or `BACKTEST_FORCE_DOWNLOAD=1`):
 
@@ -107,7 +107,7 @@ cargo run --release -- --help
 
 ## Files this program touches
 
-- `dataKLines/BTC-USDT-15m.json`: cached market data for the current default configuration. Rewritten in place if the loader detects out-of-order or duplicate timestamps.
+- `dataKLines/BTC-USDT-15m.feather`: cached market data for the current default configuration. Rewritten in place if the loader detects out-of-order or duplicate timestamps. A legacy `.json` cache from a previous version is auto-migrated to Feather on first load.
 - `results/BTC-USDT-15m.csv`: appended run history for the current default configuration.
 
 ## Configuration
