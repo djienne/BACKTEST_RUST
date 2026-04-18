@@ -1,0 +1,27 @@
+---
+version: '3'
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:2023.1
+    # image: freqtradeorg/freqtrade:develop
+    # Use plotting image
+    # image: freqtradeorg/freqtrade:develop_plot
+    # Build step - only needed when additional dependencies are needed
+    build:
+      context: .
+      dockerfile: "./Dockerfile.technical"
+    restart: 'no'
+    container_name: DL
+    volumes:
+      - "./user_data:/freqtrade/user_data"
+    # Expose api on port 8080 (localhost only)
+    # Please read the https://www.freqtrade.io/en/stable/rest-api/ documentation
+    # before enabling this.
+    ports:
+      - "127.0.0.1:9998:8080"
+    # Default command used when running `docker compose up`
+    command: >
+      download-data 
+      --timeframe 1h
+      --timerange 20190101- 
+      --config ./user_data/config_backtest.json
