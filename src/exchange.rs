@@ -2,15 +2,13 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const INTER_PAGE_DELAY_MS: u64 = 50;
 
-// All variants are kept so the candlestick interval can be selected via
-// configuration. The current binary defaults to Minute15; the rest stay
-// around for any future timeframe selection (env var, CLI flag, or strategy
-// config).
-#[allow(dead_code)]
+// All variants are reachable via the `--level` CLI flag (see `Level::FromStr`).
+// The binary defaults to `Minute15`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
     Minute1,
@@ -53,6 +51,37 @@ impl Level {
 impl std::fmt::Display for Level {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_binance_str())
+    }
+}
+
+impl FromStr for Level {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Special-case the monthly interval before lowercasing — Binance uses
+        // `1M` (capital M) for month while `1m` is one minute. Also accept
+        // the friendlier `1mo` alias.
+        let trimmed = s.trim();
+        if trimmed == "1M" || trimmed.eq_ignore_ascii_case("1mo") {
+            return Ok(Level::Month1);
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "1m" => Ok(Level::Minute1),
+            "3m" => Ok(Level::Minute3),
+            "5m" => Ok(Level::Minute5),
+            "15m" => Ok(Level::Minute15),
+            "30m" => Ok(Level::Minute30),
+            "1h" => Ok(Level::Hour1),
+            "2h" => Ok(Level::Hour2),
+            "4h" => Ok(Level::Hour4),
+            "6h" => Ok(Level::Hour6),
+            "12h" => Ok(Level::Hour12),
+            "1d" => Ok(Level::Day1),
+            "3d" => Ok(Level::Day3),
+            "1w" => Ok(Level::Week1),
+            other => Err(format!(
+                "unknown level '{other}' (expected one of: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M)"
+            )),
+        }
     }
 }
 
@@ -274,6 +303,35 @@ mod tests {
         assert_eq!(Level::Hour4.to_string(), "4h");
         assert_eq!(Level::Minute15.to_string(), "15m");
         assert_eq!(Level::Month1.to_string(), "1M");
+    }
+
+    #[test]
+    fn level_from_str_round_trips_via_display() {
+        for level in [
+            Level::Minute1, Level::Minute3, Level::Minute5, Level::Minute15,
+            Level::Minute30, Level::Hour1, Level::Hour2, Level::Hour4,
+            Level::Hour6, Level::Hour12, Level::Day1, Level::Day3,
+            Level::Week1, Level::Month1,
+        ] {
+            let parsed: Level = Level::from_str(&level.to_string())
+                .unwrap_or_else(|e| panic!("round-trip failed for {level}: {e}"));
+            assert_eq!(parsed, level);
+        }
+    }
+
+    #[test]
+    fn level_from_str_distinguishes_minute_from_month() {
+        assert_eq!(Level::from_str("1m").unwrap(), Level::Minute1);
+        assert_eq!(Level::from_str("1M").unwrap(), Level::Month1);
+        assert_eq!(Level::from_str("1mo").unwrap(), Level::Month1, "alias");
+        assert_eq!(Level::from_str("1MO").unwrap(), Level::Month1, "alias");
+    }
+
+    #[test]
+    fn level_from_str_rejects_garbage() {
+        assert!(Level::from_str("xyz").is_err());
+        assert!(Level::from_str("").is_err());
+        assert!(Level::from_str("99h").is_err());
     }
 
     #[test]

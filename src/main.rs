@@ -6,6 +6,8 @@ use backtest_rust::exchange::Level;
 use backtest_rust::output::{write_to_file, ResultRow};
 use chrono::TimeZone;
 use chrono::Utc;
+use std::borrow::Cow;
+use std::str::FromStr;
 use std::time::Instant;
 
 fn default_download_start() -> u64 {
@@ -19,7 +21,7 @@ fn default_download_start() -> u64 {
 
 fn default_run_config() -> RunConfig {
     RunConfig {
-        pair: "BTC-USDT",
+        pair: Cow::Borrowed("BTC-USDT"),
         level: Level::Minute15,
         threads: 1,
         fast_period_min: 5,
@@ -60,6 +62,32 @@ struct CliOpts {
     mode: RunMode,
     force_download: bool,
     since: Option<u64>,
+    level: Option<Level>,
+    pair: Option<String>,
+    threads: Option<usize>,
+}
+
+fn parse_pair_value(value: &str) -> anyhow::Result<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    if !upper.contains('-') {
+        anyhow::bail!("invalid --pair '{value}'; expected BASE-QUOTE form (e.g. BTC-USDT)");
+    }
+    Ok(upper)
+}
+
+fn parse_threads_value(value: &str) -> anyhow::Result<usize> {
+    let n: usize = value
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid --threads '{value}'; expected non-negative integer"))?;
+    if n == 0 {
+        let auto = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1);
+        Ok(auto)
+    } else {
+        Ok(n)
+    }
 }
 
 fn parse_since_value(value: &str) -> anyhow::Result<u64> {
@@ -86,6 +114,9 @@ where
     let mut mode = RunMode::Full;
     let mut force_download = false;
     let mut since: Option<u64> = None;
+    let mut level: Option<Level> = None;
+    let mut pair: Option<String> = None;
+    let mut threads: Option<usize> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -98,6 +129,27 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--since requires a value (YYYY-MM-DD or unix-ms)"))?;
                 since = Some(parse_since_value(value.as_ref())?);
             }
+            "--level" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--level requires a value (e.g. 5m, 15m, 1h, 4h, 1d)"))?;
+                level = Some(
+                    Level::from_str(value.as_ref())
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                );
+            }
+            "--pair" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--pair requires a value (e.g. BTC-USDT)"))?;
+                pair = Some(parse_pair_value(value.as_ref())?);
+            }
+            "--threads" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--threads requires a value (positive integer or 0 for auto)"))?;
+                threads = Some(parse_threads_value(value.as_ref())?);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -106,18 +158,28 @@ where
         }
     }
 
-    Ok(CliOpts { mode, force_download, since })
+    Ok(CliOpts {
+        mode,
+        force_download,
+        since,
+        level,
+        pair,
+        threads,
+    })
 }
 
 fn print_usage() {
     println!(
         "Usage: backtest_rust [SUBCOMMAND] [OPTIONS]\n\n\
          Subcommands:\n  \
-           download         Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n\n\
+           download              Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n\n\
          Options:\n  \
-           --force          Bypass the freshness guard and re-download\n  \
-           --since <DATE|MS>   Override download start (YYYY-MM-DD or unix-ms)\n  \
-           -h, --help       Show this message\n\n\
+           --pair <BASE-QUOTE>   Trading pair, e.g. BTC-USDT (default: BTC-USDT)\n  \
+           --level <INTERVAL>    Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)\n  \
+           --threads <N>         Rayon worker threads; 0 = auto (default: 1)\n  \
+           --force               Bypass the freshness guard and re-download\n  \
+           --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)\n  \
+           -h, --help            Show this message\n\n\
          Environment variables:\n  \
            BACKTEST_SHOW_PROGRESS=0|1   Toggle per-iteration progress log\n  \
            BACKTEST_FORCE_DOWNLOAD=0|1  Alternative to --force for the default mode"
@@ -157,14 +219,23 @@ async fn main() -> anyhow::Result<()> {
     if let Some(since) = cli.since {
         config.download_start = since;
     }
+    if let Some(level) = cli.level {
+        config.level = level;
+    }
+    if let Some(pair) = cli.pair {
+        config.pair = Cow::Owned(pair);
+    }
+    if let Some(threads) = cli.threads {
+        config.threads = threads;
+    }
 
     let env_force = read_env_bool("BACKTEST_FORCE_DOWNLOAD")?.unwrap_or(false);
     let force = cli.force_download || env_force || cli.mode == RunMode::DownloadOnly;
 
-    let data_file = data_file_path(config.pair, &config.level);
+    let data_file = data_file_path(&config.pair, &config.level);
 
     let download_result = download_dump_k_lines(
-        config.pair,
+        &config.pair,
         config.level,
         config.download_start..,
         force,
@@ -199,11 +270,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Doing: {} {}", config.pair, config.level);
-    let market = load_data_file(config.pair, &config.level)?;
+    let market = load_data_file(&config.pair, &config.level)?;
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
-    let selected = run(config, &market)?;
+    let selected = run(&config, &market)?;
 
     println!("Done");
     println!("Precision: {}", selected.precision);
@@ -223,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
     let ohlcv_file = format!("{}-{}", config.pair, config.level);
     let precision = selected.precision.to_string();
     write_to_file(
-        &results_file_path(config.pair, &config.level),
+        &results_file_path(&config.pair, &config.level),
         &ResultRow {
             ohlcv_file: &ohlcv_file,
             precision: &precision,
@@ -294,5 +365,66 @@ mod tests {
     #[test]
     fn parse_since_value_rejects_garbage() {
         assert!(parse_since_value("not-a-date").is_err());
+    }
+
+    #[test]
+    fn parse_cli_args_reads_level_flag() {
+        let cli = parse_cli_args(["--level", "4h"]).unwrap();
+        assert_eq!(cli.level, Some(Level::Hour4));
+
+        let cli2 = parse_cli_args(["--level", "1M"]).unwrap();
+        assert_eq!(cli2.level, Some(Level::Month1), "1M (capital) is monthly");
+
+        let cli3 = parse_cli_args(["--level", "1m"]).unwrap();
+        assert_eq!(cli3.level, Some(Level::Minute1), "1m (lowercase) is one-minute");
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_unknown_level() {
+        assert!(parse_cli_args(["--level", "xyz"]).is_err());
+    }
+
+    #[test]
+    fn parse_cli_args_reads_pair_and_threads() {
+        let cli =
+            parse_cli_args(["--pair", "eth-usdt", "--threads", "8"]).unwrap();
+        assert_eq!(cli.pair, Some("ETH-USDT".to_string()), "pair upper-cased");
+        assert_eq!(cli.threads, Some(8));
+    }
+
+    #[test]
+    fn parse_cli_args_threads_zero_means_auto() {
+        let cli = parse_cli_args(["--threads", "0"]).unwrap();
+        let threads = cli.threads.unwrap();
+        assert!(threads >= 1, "auto must resolve to at least 1, got {threads}");
+    }
+
+    #[test]
+    fn parse_pair_value_rejects_missing_separator() {
+        assert!(parse_pair_value("BTCUSDT").is_err());
+        assert!(parse_pair_value("BTC-USDT").is_ok());
+    }
+
+    #[test]
+    fn parse_cli_args_combines_all_flags() {
+        let cli = parse_cli_args([
+            "download",
+            "--pair",
+            "SOL-USDT",
+            "--level",
+            "1h",
+            "--threads",
+            "4",
+            "--since",
+            "2024-01-01",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(cli.mode, RunMode::DownloadOnly);
+        assert_eq!(cli.pair, Some("SOL-USDT".to_string()));
+        assert_eq!(cli.level, Some(Level::Hour1));
+        assert_eq!(cli.threads, Some(4));
+        assert!(cli.since.is_some());
+        assert!(cli.force_download);
     }
 }

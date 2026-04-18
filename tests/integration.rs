@@ -2,6 +2,7 @@ use backtest_rust::backtest::{run, ExecutionModel, RunConfig};
 use backtest_rust::data::CandleSeries;
 use backtest_rust::exchange::Level;
 use backtest_rust::precision::ACTIVE_PRECISION;
+use std::borrow::Cow;
 
 fn synthetic_market(n: usize) -> CandleSeries {
     let mut timestamps = Vec::with_capacity(n);
@@ -26,7 +27,7 @@ fn synthetic_market(n: usize) -> CandleSeries {
 
 fn small_config() -> RunConfig {
     RunConfig {
-        pair: "TEST-USDT",
+        pair: Cow::Borrowed("TEST-USDT"),
         level: Level::Hour1,
         threads: 2,
         fast_period_min: 3,
@@ -44,8 +45,8 @@ fn small_config() -> RunConfig {
 #[test]
 fn run_is_deterministic_on_synthetic_market() {
     let market = synthetic_market(200);
-    let r1 = run(small_config(), &market).unwrap();
-    let r2 = run(small_config(), &market).unwrap();
+    let r1 = run(&small_config(), &market).unwrap();
+    let r2 = run(&small_config(), &market).unwrap();
 
     assert_eq!(r1.precision, ACTIVE_PRECISION);
     assert_eq!(r1.best.fast_period, r2.best.fast_period);

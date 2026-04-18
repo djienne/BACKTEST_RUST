@@ -6,6 +6,7 @@ use crate::ta_wrapper;
 use anyhow::Context;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -22,9 +23,11 @@ impl std::fmt::Display for ExecutionModel {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RunConfig {
-    pub pair: &'static str,
+    /// Trading pair, e.g. "BTC-USDT". `Cow` so the default literal stays
+    /// borrowed (no allocation) while CLI input lives as `Cow::Owned`.
+    pub pair: Cow<'static, str>,
     pub level: Level,
     pub threads: usize,
     pub fast_period_min: usize,
@@ -314,7 +317,7 @@ fn to_active_floats(prices: &[f32]) -> Vec<Float> {
     prices.iter().copied().map(f64::from).collect()
 }
 
-pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<PrecisionRun> {
+pub fn run(config: &RunConfig, market: &CandleSeries) -> anyhow::Result<PrecisionRun> {
     let pool = ThreadPoolBuilder::new()
         .num_threads(config.threads)
         .build()
@@ -331,7 +334,7 @@ pub fn run(config: RunConfig, market: &CandleSeries) -> anyhow::Result<Precision
 
     run_precision_sweep_impl::<Float>(
         &pool,
-        &config,
+        config,
         &open,
         &close,
         config.show_progress,
