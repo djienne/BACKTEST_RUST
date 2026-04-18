@@ -120,7 +120,7 @@ impl Binance {
                 .ok_or_else(|| anyhow!("binance klines item: expected array, got {item}"))?;
             result.push(K {
                 time: values
-                    .get(0)
+                    .first()
                     .and_then(serde_json::Value::as_u64)
                     .ok_or_else(|| anyhow!("binance klines item: missing open time in {item}"))?,
                 open: parse_field(values, 1, "open price", item)?,

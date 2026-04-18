@@ -1,22 +1,22 @@
-use std::collections::HashMap;
+use crate::precision::BacktestFloat;
 
 /// Calculate EMA for a given vector of closing prices and a period.
 /// Initial values before the period are met are set to NaN.
-pub fn calculate_ema(close_prices: &[f32], period: usize) -> Vec<f32> {
-    let mut ema_values = vec![f32::NAN; close_prices.len()];
+pub fn calculate_ema<T: BacktestFloat>(close_prices: &[T], period: usize) -> Vec<T> {
+    let mut ema_values = vec![T::NAN; close_prices.len()];
 
     if period == 0 || close_prices.is_empty() {
         return ema_values;
     }
 
-    let alpha = 2.0 / (period as f32 + 1.0);
+    let alpha = T::from_f32(2.0) / (T::from_usize(period) + T::ONE);
     let mut ema = close_prices[0];
 
     for (index, &price) in close_prices.iter().enumerate() {
         if index == 0 {
             ema = price;
         } else {
-            ema = alpha * price + (1.0 - alpha) * ema;
+            ema = alpha * price + (T::ONE - alpha) * ema;
         }
 
         if index + 1 >= period {
@@ -77,21 +77,26 @@ fn compute_rsi(average_gain: f32, average_loss: f32) -> f32 {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 // Stuctures containing all needed indicators (selected periods)
-pub struct EMAStore {
-    emas: HashMap<usize, Vec<f32>>,
+pub struct EMAStore<T> {
+    period_min: usize,
+    emas: Vec<Vec<T>>,
 }
 
-impl EMAStore {
-    pub fn new(close_prices: &[f32], period_min: usize, period_max: usize) -> Self {
-        let mut emas = HashMap::new();
+impl<T: BacktestFloat> EMAStore<T> {
+    pub fn new(close_prices: &[T], period_min: usize, period_max: usize) -> Self {
+        let mut emas = Vec::with_capacity(period_max.saturating_sub(period_min) + 1);
         for period in period_min..=period_max {
-            emas.insert(period, calculate_ema(close_prices, period));
+            emas.push(calculate_ema(close_prices, period));
         }
-        EMAStore { emas }
+        EMAStore { period_min, emas }
     }
 
-    pub fn get_ema(&self, period: usize) -> &[f32] {
-        self.emas.get(&period).map(Vec::as_slice).unwrap_or(&[])
+    pub fn get_ema(&self, period: usize) -> &[T] {
+        period
+            .checked_sub(self.period_min)
+            .and_then(|index| self.emas.get(index))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -101,7 +106,7 @@ mod tests {
 
     #[test]
     fn ema_period_one_is_safe_and_matches_prices() {
-        let values = calculate_ema(&[1.0, 2.0, 3.0], 1);
+        let values = calculate_ema(&[1.0_f32, 2.0, 3.0], 1);
 
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
     }

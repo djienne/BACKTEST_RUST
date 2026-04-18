@@ -17,6 +17,18 @@ pub struct CandleSeries {
     pub close_prices: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultRow<'a> {
+    pub ohlcv_file: &'a str,
+    pub precision: &'a str,
+    pub duration_ms: f64,
+    pub port_value: f64,
+    pub max_dd: f64,
+    pub sharpe_ratio: f64,
+    pub period1: usize,
+    pub period2: usize,
+}
+
 pub fn data_file_path(pair: &str, level: &Level) -> PathBuf {
     Path::new("dataKLines").join(format!("{pair}-{level}.json"))
 }
@@ -39,6 +51,7 @@ pub fn load_data_file(pair: &str, level: &Level) -> Result<CandleSeries> {
     })
 }
 
+#[cfg(test)]
 pub fn calculate_max_drawdown(portfolio_values: &[f32]) -> f32 {
     if portfolio_values.is_empty() {
         return 0.0;
@@ -64,6 +77,7 @@ pub fn calculate_max_drawdown(portfolio_values: &[f32]) -> f32 {
     max_drawdown * 100.0
 }
 
+#[cfg(test)]
 pub fn calculate_sharpe_ratio(
     returns: &[f32],
     risk_free_rate: f32,
@@ -89,15 +103,7 @@ pub fn calculate_sharpe_ratio(
     }
 }
 
-pub fn write_to_file(
-    output_path: &Path,
-    ohlcv_file: &str,
-    port_value: f32,
-    max_dd: f32,
-    sharpe_ratio: f32,
-    period1: usize,
-    period2: usize,
-) -> std::io::Result<()> {
+pub fn write_to_file(output_path: &Path, row: &ResultRow<'_>) -> std::io::Result<()> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -116,21 +122,23 @@ pub fn write_to_file(
     if should_write_header {
         writeln!(
             writer,
-            "Filename,Date,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
+            "Filename,Date,Precision,DurationMs,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
         )?;
     }
 
     let now = Utc::now();
     writeln!(
         writer,
-        "{},{},{:.3},{:.3},{:.3},{},{}",
-        ohlcv_file,
+        "{},{},{},{:.3},{:.3},{:.3},{:.3},{},{}",
+        row.ohlcv_file,
         now.to_rfc3339(),
-        port_value,
-        max_dd,
-        sharpe_ratio,
-        period1,
-        period2
+        row.precision,
+        row.duration_ms,
+        row.port_value,
+        row.max_dd,
+        row.sharpe_ratio,
+        row.period1,
+        row.period2
     )?;
 
     writer.flush() // Make sure to flush the buffer
@@ -299,8 +307,34 @@ mod tests {
                 .as_nanos()
         ));
 
-        write_to_file(&output_path, "BTC-USDT_4h", 1.0, 2.0, 3.0, 4, 5).unwrap();
-        write_to_file(&output_path, "BTC-USDT_4h", 6.0, 7.0, 8.0, 9, 10).unwrap();
+        write_to_file(
+            &output_path,
+            &ResultRow {
+                ohlcv_file: "BTC-USDT_4h",
+                precision: "f32",
+                duration_ms: 10.0,
+                port_value: 1.0,
+                max_dd: 2.0,
+                sharpe_ratio: 3.0,
+                period1: 4,
+                period2: 5,
+            },
+        )
+        .unwrap();
+        write_to_file(
+            &output_path,
+            &ResultRow {
+                ohlcv_file: "BTC-USDT_4h",
+                precision: "f64",
+                duration_ms: 11.0,
+                port_value: 6.0,
+                max_dd: 7.0,
+                sharpe_ratio: 8.0,
+                period1: 9,
+                period2: 10,
+            },
+        )
+        .unwrap();
 
         let contents = fs::read_to_string(&output_path).unwrap();
         let lines = contents.lines().collect::<Vec<_>>();
@@ -308,7 +342,7 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[0],
-            "Filename,Date,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
+            "Filename,Date,Precision,DurationMs,portfolio_val,max_dd,sharpe_ratio,Period1,Period2"
         );
 
         fs::remove_file(output_path).unwrap();
