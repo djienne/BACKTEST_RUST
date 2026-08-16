@@ -358,7 +358,8 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
         engine,
         format_args!("Calculating all indicators for {ACTIVE_PRECISION}..."),
     );
-    let cache = S::build_cache::<T>(bars, strategy_config);
+    let cache = S::build_cache::<T>(bars, strategy_config)
+        .with_context(|| format!("strategy '{}' could not build its indicators", S::NAME))?;
     let backtest_config = numeric_backtest_config::<T>(engine);
     let split = sample_split(bars.len(), engine.split);
 
@@ -523,8 +524,11 @@ mod tests {
         type Config = Vec<Signal>;
         const NAME: &'static str = "signal_script";
 
-        fn build_cache<T: BacktestFloat>(_: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
-            cfg.clone()
+        fn build_cache<T: BacktestFloat>(
+            _: Bars<'_, T>,
+            cfg: &Self::Config,
+        ) -> anyhow::Result<Self::Cache<T>> {
+            Ok(cfg.clone())
         }
 
         fn enumerate_params(_: &Self::Config) -> Vec<Self::Params> {

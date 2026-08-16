@@ -190,6 +190,78 @@ impl<T: BacktestFloat> PeriodCache<T> {
     }
 }
 
+/// Rough ceiling on a [`SeriesCache`], so a careless sweep fails with an
+/// explanation instead of exhausting memory.
+const SERIES_CACHE_BUDGET_BYTES: usize = 4 << 30;
+
+/// One indicator series per *parameter tuple*, rather than per period.
+///
+/// Use this when a parameter combination cannot share a series with its
+/// neighbours — Supertrend's bands are path-dependent, a MACD histogram
+/// depends on all three of its periods — and use [`PeriodCache`] otherwise.
+/// The difference is not stylistic: a two-EMA sweep over 600 periods has
+/// ~180k combinations but only 600 distinct series, so a per-combination cache
+/// would need three hundred times the memory. Hence the budget check.
+pub struct SeriesCache<T> {
+    len: usize,
+    buffer: Vec<T>,
+}
+
+/// Summarised rather than dumped: these hold hundreds of megabytes of series,
+/// and a `{:?}` of that in a test failure helps nobody.
+impl<T> std::fmt::Debug for SeriesCache<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeriesCache")
+            .field("bars", &self.len)
+            .field("series", &(self.buffer.len() / self.len.max(1)))
+            .finish()
+    }
+}
+
+impl<T: BacktestFloat> SeriesCache<T> {
+    /// Compute one series per entry of `params`, in parallel.
+    pub fn build<P, F>(bars: &BarsF64, params: &[P], indicator: F) -> anyhow::Result<Self>
+    where
+        P: Copy + Send + Sync,
+        F: Fn(&BarsF64, P) -> Vec<f64> + Sync,
+    {
+        let len = bars.len();
+        let bytes = params
+            .len()
+            .saturating_mul(len)
+            .saturating_mul(std::mem::size_of::<T>());
+        if bytes > SERIES_CACHE_BUDGET_BYTES {
+            anyhow::bail!(
+                "this parameter sweep needs {:.1} GiB of indicator cache \
+                 ({} combinations x {len} bars); narrow the ranges with --param",
+                bytes as f64 / (1u64 << 30) as f64,
+                params.len(),
+            );
+        }
+
+        let mut buffer = vec![T::NAN; len * params.len()];
+        buffer
+            .par_chunks_mut(len.max(1))
+            .zip(params.par_iter())
+            .for_each(|(slot, &param)| {
+                let series = indicator(bars, param);
+                debug_assert_eq!(series.len(), len, "indicator changed the series length");
+                for (target, value) in slot.iter_mut().zip(series.iter()) {
+                    *target = T::from_f64(*value);
+                }
+            });
+
+        Ok(Self { len, buffer })
+    }
+
+    /// The series for the parameter tuple at `index` in the slice passed to
+    /// [`SeriesCache::build`].
+    pub fn get(&self, index: usize) -> Option<&[T]> {
+        let start = index.checked_mul(self.len)?;
+        self.buffer.get(start..start + self.len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

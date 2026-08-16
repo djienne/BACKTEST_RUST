@@ -9,7 +9,8 @@ use crate::data::Bars;
 use crate::indicators::ma::ema;
 use crate::indicators::{BarsF64, PeriodCache};
 use crate::precision::BacktestFloat;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::params::ParamSpec;
+use crate::strategy::{ConfigurableStrategy, Signal, Strategy};
 use std::cmp::Ordering;
 
 pub struct DoubleEmaCrossover;
@@ -21,20 +22,33 @@ pub struct DoubleEmaConfig {
     pub max_period: usize,
 }
 
+impl Default for DoubleEmaConfig {
+    fn default() -> Self {
+        Self {
+            fast_period_min: 5,
+            slow_period_min: 6,
+            max_period: 600,
+        }
+    }
+}
+
 impl Strategy for DoubleEmaCrossover {
     type Params = (usize, usize);
     type Cache<T: BacktestFloat> = PeriodCache<T>;
     type Config = DoubleEmaConfig;
     const NAME: &'static str = "double_ema";
 
-    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
+    fn build_cache<T: BacktestFloat>(
+        bars: Bars<'_, T>,
+        cfg: &Self::Config,
+    ) -> anyhow::Result<Self::Cache<T>> {
         let source = BarsF64::from_bars(bars);
-        PeriodCache::build(
+        Ok(PeriodCache::build(
             &source,
             cfg.fast_period_min,
             cfg.max_period,
             |bars, period| ema(&bars.close, period),
-        )
+        ))
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -75,6 +89,36 @@ impl Strategy for DoubleEmaCrossover {
     /// reproducible regardless of how rayon happened to schedule it.
     fn tie_break(left: Self::Params, right: Self::Params) -> Ordering {
         left.cmp(&right)
+    }
+}
+
+impl ConfigurableStrategy for DoubleEmaCrossover {
+    const DESCRIPTION: &'static str = "Hold while the fast EMA is above the slow EMA";
+    const PARAMETERS: &'static [(&'static str, &'static str)] = &[
+        ("fast_min", "smallest fast period (default 5)"),
+        ("slow_min", "smallest slow period (default 6)"),
+        ("max_period", "largest period of either EMA (default 600)"),
+    ];
+
+    fn config_from(spec: &ParamSpec) -> anyhow::Result<Self::Config> {
+        spec.reject_unknown(&Self::parameter_names())?;
+        let defaults = DoubleEmaConfig::default();
+        let config = DoubleEmaConfig {
+            fast_period_min: spec.scalar("fast_min", defaults.fast_period_min)?,
+            slow_period_min: spec.scalar("slow_min", defaults.slow_period_min)?,
+            max_period: spec.scalar("max_period", defaults.max_period)?,
+        };
+        if config.fast_period_min == 0 || config.slow_period_min == 0 {
+            anyhow::bail!("EMA periods must be at least 1");
+        }
+        if config.max_period < config.slow_period_min {
+            anyhow::bail!(
+                "max_period ({}) is below slow_min ({}), leaving nothing to sweep",
+                config.max_period,
+                config.slow_period_min
+            );
+        }
+        Ok(config)
     }
 }
 
@@ -122,10 +166,16 @@ mod tests {
             slow_period_min: 6,
             max_period: 12,
         };
-        let cache = DoubleEmaCrossover::build_cache::<f32>(prices.bars(), &cfg);
+        let cache = DoubleEmaCrossover::build_cache::<f32>(prices.bars(), &cfg).unwrap();
         for (fast, slow) in DoubleEmaCrossover::enumerate_params(&cfg) {
             assert!(cache.get(fast).is_some(), "missing fast period {fast}");
             assert!(cache.get(slow).is_some(), "missing slow period {slow}");
         }
+    }
+
+    #[test]
+    fn config_from_rejects_a_search_space_with_nothing_in_it() {
+        let spec = ParamSpec::parse(["slow_min=50", "max_period=20"]).unwrap();
+        assert!(DoubleEmaCrossover::config_from(&spec).is_err());
     }
 }

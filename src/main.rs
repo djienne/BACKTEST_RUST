@@ -1,11 +1,11 @@
 use anyhow::Context as _;
-use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
+use backtest_rust::backtest::{BacktestMetrics, EngineConfig, ExecutionModel};
 use backtest_rust::data::{load_data_file, DataPaths};
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 use backtest_rust::output::{write_to_file, ResultRow};
-use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
-use backtest_rust::strategy::Strategy;
+use backtest_rust::strategy::params::ParamSpec;
+use backtest_rust::strategy::registry::{self, DEFAULT_STRATEGY};
 use chrono::TimeZone;
 use chrono::Utc;
 use std::borrow::Cow;
@@ -37,14 +37,6 @@ fn default_engine_config() -> EngineConfig {
     }
 }
 
-fn default_strategy_config() -> DoubleEmaConfig {
-    DoubleEmaConfig {
-        fast_period_min: 5,
-        slow_period_min: 6,
-        max_period: 600,
-    }
-}
-
 fn parse_env_bool(value: &str) -> anyhow::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -64,6 +56,7 @@ fn read_env_bool(name: &str) -> anyhow::Result<Option<bool>> {
 enum RunMode {
     Full,
     DownloadOnly,
+    ListStrategies,
 }
 
 #[derive(Debug)]
@@ -77,6 +70,8 @@ struct CliOpts {
     data_dir: Option<String>,
     results_dir: Option<String>,
     split: Option<f32>,
+    strategy: Option<String>,
+    params: Vec<String>,
 }
 
 impl CliOpts {
@@ -145,11 +140,26 @@ where
     let mut data_dir: Option<String> = None;
     let mut results_dir: Option<String> = None;
     let mut split: Option<f32> = None;
+    let mut strategy: Option<String> = None;
+    let mut params: Vec<String> = Vec::new();
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_ref() {
             "download" => mode = RunMode::DownloadOnly,
+            "list-strategies" => mode = RunMode::ListStrategies,
+            "--strategy" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--strategy requires a name"))?;
+                strategy = Some(value.as_ref().trim().to_ascii_lowercase());
+            }
+            "--param" => {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--param requires an entry (e.g. period=5..100)")
+                })?;
+                params.push(value.as_ref().to_string());
+            }
             "--force" => force_download = true,
             "--since" => {
                 let value = iter.next().ok_or_else(|| {
@@ -211,6 +221,8 @@ where
         data_dir,
         results_dir,
         split,
+        strategy,
+        params,
     })
 }
 
@@ -225,12 +237,32 @@ fn parse_split_value(value: &str) -> anyhow::Result<f32> {
     Ok(fraction)
 }
 
+fn print_strategies() {
+    println!("Available strategies:\n");
+    for info in registry::available() {
+        let default = if info.name == DEFAULT_STRATEGY {
+            "  (default)"
+        } else {
+            ""
+        };
+        println!("  {}{default}\n    {}", info.name, info.description);
+        for (parameter, help) in info.parameters {
+            println!("      --param {parameter}=…  {help}");
+        }
+        println!();
+    }
+    println!("Ranges are written min..max; a bare number pins the value.");
+}
+
 fn print_usage() {
     println!(
         "Usage: backtest_rust [SUBCOMMAND] [OPTIONS]\n\n\
          Subcommands:\n  \
-           download              Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n\n\
+           download              Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n  \
+           list-strategies       Print the available strategies and their parameters, then exit\n\n\
          Options:\n  \
+           --strategy <NAME>     Strategy to sweep (default: {DEFAULT_STRATEGY}; see list-strategies)\n  \
+           --param <NAME=VALUE>  Strategy parameter; repeatable. Ranges are min..max\n  \
            --pair <BASE-QUOTE>   Trading pair, e.g. BTC-USDT (default: BTC-USDT)\n  \
            --level <INTERVAL>    Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)\n  \
            --threads <N>         Rayon worker threads; 0 = auto (default: 1)\n  \
@@ -255,7 +287,7 @@ fn load_engine_config() -> anyhow::Result<EngineConfig> {
     Ok(config)
 }
 
-fn print_metrics(label: &str, m: &backtest_rust::backtest::BacktestMetrics) {
+fn print_metrics(label: &str, m: &BacktestMetrics) {
     println!(
         "{label}: value {:.3}$ | sharpe {:.6} | sortino {:.6} | calmar {:.3} | \
          cagr {:.2}% | max_dd {:.2}% | trades {} | win {:.1}% | exposure {:.1}%",
@@ -292,8 +324,18 @@ async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let cli = parse_cli_args(&raw_args)?;
 
+    if cli.mode == RunMode::ListStrategies {
+        print_strategies();
+        return Ok(());
+    }
+
+    let strategy_name = cli
+        .strategy
+        .clone()
+        .unwrap_or_else(|| DEFAULT_STRATEGY.to_string());
+    let strategy_params = ParamSpec::parse(&cli.params)?;
+
     let mut engine = load_engine_config()?;
-    let strategy_config = default_strategy_config();
 
     if let Some(since) = cli.since {
         engine.download_start = since;
@@ -358,42 +400,41 @@ async fn main() -> anyhow::Result<()> {
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
-    let selected = run::<DoubleEmaCrossover>(&engine, &strategy_config, &market)?;
-    let params_summary = DoubleEmaCrossover::param_summary(selected.best.params);
+    let report = registry::run_named(&strategy_name, &engine, &strategy_params, &market)?;
 
     println!("Done");
-    println!("Strategy: {}", DoubleEmaCrossover::NAME);
-    println!("Precision: {}", selected.precision);
-    println!("Best params: {params_summary}");
+    println!("Strategy: {}", report.name);
+    println!("Precision: {}", report.precision);
+    println!("Best params: {}", report.params);
     print_metrics(
-        if selected.out_of_sample.is_some() {
+        if report.out_of_sample.is_some() {
             "In-sample"
         } else {
             "Result"
         },
-        &selected.best.metrics,
+        &report.metrics,
     );
-    if let Some(out_of_sample) = &selected.out_of_sample {
+    if let Some(out_of_sample) = &report.out_of_sample {
         print_metrics("Out-of-sample", out_of_sample);
         println!(
             "  (the out-of-sample row is the honest one; the in-sample row is \
              fitted to its own data)"
         );
     }
-    println!("Sweep duration: {:.3}s", selected.duration.as_secs_f64());
+    println!("Sweep duration: {:.3}s", report.duration.as_secs_f64());
 
     let ohlcv_file = format!("{}-{}", engine.pair, engine.level);
-    let precision = selected.precision.to_string();
+    let precision = report.precision.to_string();
     write_to_file(
         &paths.results(&engine.pair, &engine.level),
         &ResultRow {
             ohlcv_file: &ohlcv_file,
             precision: &precision,
-            strategy: DoubleEmaCrossover::NAME,
-            params: &params_summary,
-            duration_ms: selected.duration.as_secs_f64() * 1000.0,
-            metrics: selected.best.metrics,
-            out_of_sample: selected.out_of_sample,
+            strategy: report.name,
+            params: &report.params,
+            duration_ms: report.duration.as_secs_f64() * 1000.0,
+            metrics: report.metrics,
+            out_of_sample: report.out_of_sample,
         },
     )?;
 
@@ -499,6 +540,65 @@ mod tests {
     fn parse_pair_value_rejects_missing_separator() {
         assert!(parse_pair_value("BTCUSDT").is_err());
         assert!(parse_pair_value("BTC-USDT").is_ok());
+    }
+
+    #[test]
+    fn parse_cli_args_reads_strategy_and_repeated_params() {
+        let cli = parse_cli_args([
+            "--strategy",
+            "RSI_Reversion",
+            "--param",
+            "period=5..30",
+            "--param",
+            "oversold=25",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.strategy,
+            Some("rsi_reversion".to_string()),
+            "strategy names fold case"
+        );
+        assert_eq!(cli.params, vec!["period=5..30", "oversold=25"]);
+        let spec = ParamSpec::parse(&cli.params).unwrap();
+        assert_eq!(spec.range("period", 1..=1).unwrap(), 5..=30);
+    }
+
+    #[test]
+    fn parse_cli_args_reads_the_list_strategies_subcommand() {
+        let cli = parse_cli_args(["list-strategies"]).unwrap();
+        assert_eq!(cli.mode, RunMode::ListStrategies);
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_flags_missing_their_value() {
+        assert!(parse_cli_args(["--strategy"]).is_err());
+        assert!(parse_cli_args(["--param"]).is_err());
+        assert!(parse_cli_args(["--split"]).is_err());
+        assert!(parse_cli_args(["--data-dir"]).is_err());
+    }
+
+    #[test]
+    fn parse_cli_args_reads_split_and_directories() {
+        let cli = parse_cli_args([
+            "--split",
+            "0.7",
+            "--data-dir",
+            "some/klines",
+            "--results-dir",
+            "some/results",
+        ])
+        .unwrap();
+        assert_eq!(cli.split, Some(0.7));
+        let paths = cli.data_paths();
+        assert_eq!(paths.klines_dir(), std::path::Path::new("some/klines"));
+    }
+
+    #[test]
+    fn parse_split_value_rejects_values_outside_zero_to_one() {
+        assert!(parse_split_value("1.5").is_err());
+        assert!(parse_split_value("-0.2").is_err());
+        assert!(parse_split_value("half").is_err());
+        assert_eq!(parse_split_value("0.8").unwrap(), 0.8);
     }
 
     #[test]

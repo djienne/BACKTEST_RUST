@@ -10,10 +10,18 @@
 
 use crate::data::Bars;
 use crate::precision::BacktestFloat;
+use crate::strategy::params::ParamSpec;
 use std::cmp::Ordering;
 
+pub mod bb_reversion;
 pub mod double_ema;
+pub mod macd_cross;
+pub mod params;
+pub mod registry;
+pub mod rsi_reversion;
 pub mod single_ema;
+pub mod stoch_rsi;
+pub mod supertrend;
 
 /// Engine-tracked position state.
 ///
@@ -47,7 +55,14 @@ pub trait Strategy {
 
     /// Precompute every indicator the parameter sweep will read. Called once
     /// per run; the result is shared read-only across all worker threads.
-    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T>;
+    ///
+    /// Fallible so a strategy can refuse a configuration it cannot serve —
+    /// notably one whose cache would not fit in memory (see
+    /// `indicators::SeriesCache`) — rather than dying mid-sweep.
+    fn build_cache<T: BacktestFloat>(
+        bars: Bars<'_, T>,
+        cfg: &Self::Config,
+    ) -> anyhow::Result<Self::Cache<T>>;
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params>;
 
@@ -71,4 +86,25 @@ pub trait Strategy {
     /// Returning `Less` means `left` wins; `Greater` means `right` wins;
     /// `Equal` means the engine picks `left` deterministically.
     fn tie_break(left: Self::Params, right: Self::Params) -> Ordering;
+}
+
+/// A strategy the CLI can name and configure.
+///
+/// Splitting this from [`Strategy`] keeps the engine's contract free of
+/// anything CLI-shaped: a strategy used only from Rust needs `Strategy` alone.
+pub trait ConfigurableStrategy: Strategy {
+    /// One line for `list-strategies`.
+    const DESCRIPTION: &'static str;
+    /// The `--param` names this strategy reads, with their defaults.
+    const PARAMETERS: &'static [(&'static str, &'static str)];
+
+    /// Build the strategy's config from `--param` entries, applying defaults.
+    /// Implementations should call [`ParamSpec::reject_unknown`] so a typo is
+    /// reported rather than ignored.
+    fn config_from(spec: &ParamSpec) -> anyhow::Result<Self::Config>;
+
+    /// The `--param` names, for the unknown-name check and for help text.
+    fn parameter_names() -> Vec<&'static str> {
+        Self::PARAMETERS.iter().map(|(name, _)| *name).collect()
+    }
 }

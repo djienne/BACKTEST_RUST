@@ -8,7 +8,8 @@ use crate::data::Bars;
 use crate::indicators::ma::ema;
 use crate::indicators::{BarsF64, PeriodCache};
 use crate::precision::BacktestFloat;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::params::ParamSpec;
+use crate::strategy::{ConfigurableStrategy, Signal, Strategy};
 use std::cmp::Ordering;
 
 pub struct PriceVsEma;
@@ -19,17 +20,32 @@ pub struct PriceVsEmaConfig {
     pub period_max: usize,
 }
 
+impl Default for PriceVsEmaConfig {
+    fn default() -> Self {
+        Self {
+            period_min: 5,
+            period_max: 200,
+        }
+    }
+}
+
 impl Strategy for PriceVsEma {
     type Params = usize;
     type Cache<T: BacktestFloat> = PeriodCache<T>;
     type Config = PriceVsEmaConfig;
     const NAME: &'static str = "price_vs_ema";
 
-    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
+    fn build_cache<T: BacktestFloat>(
+        bars: Bars<'_, T>,
+        cfg: &Self::Config,
+    ) -> anyhow::Result<Self::Cache<T>> {
         let source = BarsF64::from_bars(bars);
-        PeriodCache::build(&source, cfg.period_min, cfg.period_max, |bars, period| {
-            ema(&bars.close, period)
-        })
+        Ok(PeriodCache::build(
+            &source,
+            cfg.period_min,
+            cfg.period_max,
+            |bars, period| ema(&bars.close, period),
+        ))
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -64,6 +80,22 @@ impl Strategy for PriceVsEma {
 
     fn tie_break(left: Self::Params, right: Self::Params) -> Ordering {
         left.cmp(&right)
+    }
+}
+
+impl ConfigurableStrategy for PriceVsEma {
+    const DESCRIPTION: &'static str = "Hold while the close is above a single EMA";
+    const PARAMETERS: &'static [(&'static str, &'static str)] =
+        &[("period", "EMA period (default 5..200)")];
+
+    fn config_from(spec: &ParamSpec) -> anyhow::Result<Self::Config> {
+        spec.reject_unknown(&Self::parameter_names())?;
+        let defaults = PriceVsEmaConfig::default();
+        let range = spec.range("period", defaults.period_min..=defaults.period_max)?;
+        Ok(PriceVsEmaConfig {
+            period_min: *range.start(),
+            period_max: *range.end(),
+        })
     }
 }
 
