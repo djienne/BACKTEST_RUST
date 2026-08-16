@@ -5,3 +5,10 @@
 # fixture for `data::tests::load_data_file_reads_repository_fixture`.
 dataKLines/*.feather
 !dataKLines/BTC-USDT-4h.feather
+
+# Secrets — the real .env must never be committed.
+.env
+.env.*
+
+# ...but the placeholder template must stay tracked.
+!.env.example
