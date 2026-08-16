@@ -235,7 +235,9 @@ impl Binance {
     /// retries, which is what tests want.
     pub fn with_retries(max_retries: u32) -> Result<Self> {
         Ok(Self {
-            client: reqwest::ClientBuilder::new().timeout(REQUEST_TIMEOUT).build()?,
+            client: reqwest::ClientBuilder::new()
+                .timeout(REQUEST_TIMEOUT)
+                .build()?,
             max_retries,
             base_backoff: DEFAULT_BACKOFF,
         })
@@ -273,7 +275,13 @@ impl Binance {
         &self,
         query: &[(&'static str, String)],
     ) -> std::result::Result<serde_json::Value, FetchError> {
-        let response = match self.client.get(BINANCE_KLINES_URL).query(query).send().await {
+        let response = match self
+            .client
+            .get(BINANCE_KLINES_URL)
+            .query(query)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 let transient = error.is_timeout() || error.is_connect();
@@ -303,10 +311,13 @@ impl Binance {
             });
         }
 
-        response.json().await.map_err(|error| FetchError::Retryable {
-            error: anyhow::Error::new(error).context("binance klines: malformed response body"),
-            delay: None,
-        })
+        response
+            .json()
+            .await
+            .map_err(|error| FetchError::Retryable {
+                error: anyhow::Error::new(error).context("binance klines: malformed response body"),
+                delay: None,
+            })
     }
 }
 
@@ -381,9 +392,9 @@ impl KlineProvider for Binance {
 
             let mut result = Vec::with_capacity(array.len());
             for item in array.iter().rev() {
-                let values = item.as_array().ok_or_else(|| {
-                    anyhow!("binance klines item: expected array, got {item}")
-                })?;
+                let values = item
+                    .as_array()
+                    .ok_or_else(|| anyhow!("binance klines item: expected array, got {item}"))?;
                 result.push(K {
                     time: values
                         .first()
@@ -405,7 +416,11 @@ impl KlineProvider for Binance {
 /// Build the query parameters for Binance's `/api/v3/klines` endpoint.
 /// `end_time_ms` is treated as **inclusive** to match the Binance API
 /// contract; pass `0` to omit the parameter entirely.
-fn build_klines_query(symbol: &str, interval: &str, end_time_ms: u64) -> Vec<(&'static str, String)> {
+fn build_klines_query(
+    symbol: &str,
+    interval: &str,
+    end_time_ms: u64,
+) -> Vec<(&'static str, String)> {
     let mut query: Vec<(&'static str, String)> = vec![
         ("symbol", symbol.to_string()),
         ("interval", interval.to_string()),
@@ -501,10 +516,20 @@ mod tests {
     #[test]
     fn level_from_str_round_trips_via_display() {
         for level in [
-            Level::Minute1, Level::Minute3, Level::Minute5, Level::Minute15,
-            Level::Minute30, Level::Hour1, Level::Hour2, Level::Hour4,
-            Level::Hour6, Level::Hour12, Level::Day1, Level::Day3,
-            Level::Week1, Level::Month1,
+            Level::Minute1,
+            Level::Minute3,
+            Level::Minute5,
+            Level::Minute15,
+            Level::Minute30,
+            Level::Hour1,
+            Level::Hour2,
+            Level::Hour4,
+            Level::Hour6,
+            Level::Hour12,
+            Level::Day1,
+            Level::Day3,
+            Level::Week1,
+            Level::Month1,
         ] {
             let parsed: Level = Level::from_str(&level.to_string())
                 .unwrap_or_else(|e| panic!("round-trip failed for {level}: {e}"));

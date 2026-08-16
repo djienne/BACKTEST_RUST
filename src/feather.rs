@@ -69,13 +69,8 @@ pub fn write(path: &Path, candles: &[K]) -> Result<()> {
     }
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| {
-            format!(
-                "failed to rename {} → {}",
-                tmp.display(),
-                path.display()
-            )
-        });
+        return Err(error)
+            .with_context(|| format!("failed to rename {} → {}", tmp.display(), path.display()));
     }
     Ok(())
 }
@@ -90,9 +85,8 @@ fn write_batch_to(tmp: &Path, schema: &Arc<Schema>, batch: &RecordBatch) -> Resu
     let file = File::create(tmp)
         .with_context(|| format!("failed to create temp feather file: {}", tmp.display()))?;
     let writer = BufWriter::new(file);
-    let mut writer = FileWriter::try_new(writer, schema.as_ref()).with_context(|| {
-        format!("failed to construct feather writer for {}", tmp.display())
-    })?;
+    let mut writer = FileWriter::try_new(writer, schema.as_ref())
+        .with_context(|| format!("failed to construct feather writer for {}", tmp.display()))?;
     writer
         .write(batch)
         .with_context(|| format!("failed to write RecordBatch to {}", tmp.display()))?;
@@ -114,8 +108,8 @@ pub fn read(path: &Path) -> Result<Vec<K>> {
 
     let mut out: Vec<K> = Vec::new();
     for (idx, batch) in reader.enumerate() {
-        let batch = batch
-            .with_context(|| format!("failed to read batch {idx} from {}", path.display()))?;
+        let batch =
+            batch.with_context(|| format!("failed to read batch {idx} from {}", path.display()))?;
         append_batch(&mut out, &batch, path)?;
     }
     Ok(out)
@@ -134,8 +128,8 @@ pub fn read_last_time(path: &Path) -> Result<u64> {
 
     let mut max: Option<u64> = None;
     for (idx, batch) in reader.enumerate() {
-        let batch = batch
-            .with_context(|| format!("failed to read batch {idx} from {}", path.display()))?;
+        let batch =
+            batch.with_context(|| format!("failed to read batch {idx} from {}", path.display()))?;
         let time = batch
             .column(0)
             .as_any()
@@ -211,11 +205,7 @@ fn append_batch(out: &mut Vec<K>, batch: &RecordBatch, path: &Path) -> Result<()
     Ok(())
 }
 
-fn downcast_u64<'a>(
-    batch: &'a RecordBatch,
-    idx: usize,
-    path: &Path,
-) -> Result<&'a UInt64Array> {
+fn downcast_u64<'a>(batch: &'a RecordBatch, idx: usize, path: &Path) -> Result<&'a UInt64Array> {
     batch
         .column(idx)
         .as_any()
@@ -229,11 +219,7 @@ fn downcast_u64<'a>(
         })
 }
 
-fn downcast_f32<'a>(
-    batch: &'a RecordBatch,
-    idx: usize,
-    path: &Path,
-) -> Result<&'a Float32Array> {
+fn downcast_f32<'a>(batch: &'a RecordBatch, idx: usize, path: &Path) -> Result<&'a Float32Array> {
     batch
         .column(idx)
         .as_any()

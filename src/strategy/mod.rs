@@ -44,11 +44,8 @@ pub trait Strategy {
 
     const NAME: &'static str;
 
-    fn build_cache<T: BacktestFloat>(
-        open: &[T],
-        close: &[T],
-        cfg: &Self::Config,
-    ) -> Self::Cache<T>;
+    fn build_cache<T: BacktestFloat>(open: &[T], close: &[T], cfg: &Self::Config)
+        -> Self::Cache<T>;
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params>;
 

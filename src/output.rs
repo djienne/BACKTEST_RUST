@@ -80,8 +80,14 @@ mod tests {
     #[test]
     fn csv_escape_quotes_and_doubles_quotes() {
         assert_eq!(csv_escape("a,b"), Cow::Owned::<str>("\"a,b\"".to_string()));
-        assert_eq!(csv_escape("a\"b"), Cow::Owned::<str>("\"a\"\"b\"".to_string()));
-        assert_eq!(csv_escape("a\nb"), Cow::Owned::<str>("\"a\nb\"".to_string()));
+        assert_eq!(
+            csv_escape("a\"b"),
+            Cow::Owned::<str>("\"a\"\"b\"".to_string())
+        );
+        assert_eq!(
+            csv_escape("a\nb"),
+            Cow::Owned::<str>("\"a\nb\"".to_string())
+        );
     }
 
     #[test]

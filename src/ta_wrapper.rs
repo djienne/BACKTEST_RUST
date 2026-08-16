@@ -57,7 +57,10 @@ impl<T: BacktestFloat> EMAStore<T> {
     /// EMA calculation so unit tests can pin exact indicator values.
     #[cfg(test)]
     pub fn from_series(period_min: usize, periods: Vec<Vec<T>>) -> Self {
-        EMAStore { period_min, emas: periods }
+        EMAStore {
+            period_min,
+            emas: periods,
+        }
     }
 }
 

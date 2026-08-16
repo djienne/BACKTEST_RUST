@@ -111,9 +111,10 @@ pub fn ema_parameter_pairs(
     pairs
 }
 
-fn prefer<S: Strategy>(left: SweepResult<S::Params>, right: SweepResult<S::Params>)
-    -> SweepResult<S::Params>
-{
+fn prefer<S: Strategy>(
+    left: SweepResult<S::Params>,
+    right: SweepResult<S::Params>,
+) -> SweepResult<S::Params> {
     let left_finite = left.metrics.sharpe_ratio.is_finite();
     let right_finite = right.metrics.sharpe_ratio.is_finite();
     match (left_finite, right_finite) {
@@ -139,9 +140,7 @@ fn prefer<S: Strategy>(left: SweepResult<S::Params>, right: SweepResult<S::Param
     }
 }
 
-fn numeric_backtest_config<T: BacktestFloat>(
-    engine: &EngineConfig,
-) -> NumericBacktestConfig<T> {
+fn numeric_backtest_config<T: BacktestFloat>(engine: &EngineConfig) -> NumericBacktestConfig<T> {
     NumericBacktestConfig {
         periods_per_year: periods_per_year(engine.level),
         starting_capital: T::from_f32(engine.starting_capital),
@@ -192,9 +191,7 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
     };
     let marks = &close[1..n];
 
-    for (bar_index, (&trade_price, &mark_price)) in
-        trades.iter().zip(marks.iter()).enumerate()
-    {
+    for (bar_index, (&trade_price, &mark_price)) in trades.iter().zip(marks.iter()).enumerate() {
         let signal = evaluator(bar_index);
         match (current, signal) {
             (Position::Flat, Signal::EnterLong) => {
@@ -274,8 +271,7 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                             && (count.is_multiple_of(engine.progress_step)
                                 || count == total_iterations)
                         {
-                            let percentage =
-                                (count as f32 / total_iterations as f32) * 100.0;
+                            let percentage = (count as f32 / total_iterations as f32) * 100.0;
                             println!(
                                 "  ...Progress: {:6}/{:6} iterations completed {:5.1}%.",
                                 count, total_iterations, percentage
@@ -298,9 +294,7 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                     },
                 )
         })
-        .with_context(|| {
-            format!("strategy '{}' produced an empty parameter sweep", S::NAME)
-        })?;
+        .with_context(|| format!("strategy '{}' produced an empty parameter sweep", S::NAME))?;
 
     Ok(PrecisionRun {
         precision: ACTIVE_PRECISION,
@@ -451,18 +445,31 @@ mod tests {
             type Config = Vec<Signal>;
             const NAME: &'static str = "test";
 
-            fn build_cache<T: BacktestFloat>(_: &[T], _: &[T], cfg: &Self::Config)
-                -> Self::Cache<T>
-            { cfg.clone() }
+            fn build_cache<T: BacktestFloat>(
+                _: &[T],
+                _: &[T],
+                cfg: &Self::Config,
+            ) -> Self::Cache<T> {
+                cfg.clone()
+            }
 
-            fn enumerate_params(_: &Self::Config) -> Vec<Self::Params> { vec![()] }
+            fn enumerate_params(_: &Self::Config) -> Vec<Self::Params> {
+                vec![()]
+            }
 
-            fn evaluator<'a, T: BacktestFloat>(cache: &'a Self::Cache<T>, _: ())
-                -> impl Fn(usize) -> Signal + 'a
-            { move |i| cache[i] }
+            fn evaluator<'a, T: BacktestFloat>(
+                cache: &'a Self::Cache<T>,
+                _: (),
+            ) -> impl Fn(usize) -> Signal + 'a {
+                move |i| cache[i]
+            }
 
-            fn param_summary(_: ()) -> String { String::new() }
-            fn tie_break(_: (), _: ()) -> Ordering { Ordering::Equal }
+            fn param_summary(_: ()) -> String {
+                String::new()
+            }
+            fn tie_break(_: (), _: ()) -> Ordering {
+                Ordering::Equal
+            }
         }
 
         // 4 bars; engine reads signals at bar_index = 0..=2 (n - 1 = 3 iters).
@@ -482,8 +489,11 @@ mod tests {
             num_cfg::<f32>(1000.0),
         );
 
-        assert!((metrics.final_value - 499.25).abs() < 1e-3,
-            "final = {}", metrics.final_value);
+        assert!(
+            (metrics.final_value - 499.25).abs() < 1e-3,
+            "final = {}",
+            metrics.final_value
+        );
     }
 
     #[test]
@@ -500,7 +510,11 @@ mod tests {
 
     fn sweep<P: Copy>(params: P, sharpe: f64, final_value: f64) -> SweepResult<P> {
         SweepResult {
-            metrics: BacktestMetrics { final_value, max_drawdown: 0.0, sharpe_ratio: sharpe },
+            metrics: BacktestMetrics {
+                final_value,
+                max_drawdown: 0.0,
+                sharpe_ratio: sharpe,
+            },
             params,
         }
     }

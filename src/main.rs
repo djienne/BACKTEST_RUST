@@ -149,19 +149,16 @@ where
             "download" => mode = RunMode::DownloadOnly,
             "--force" => force_download = true,
             "--since" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--since requires a value (YYYY-MM-DD or unix-ms)"))?;
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--since requires a value (YYYY-MM-DD or unix-ms)")
+                })?;
                 since = Some(parse_since_value(value.as_ref())?);
             }
             "--level" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--level requires a value (e.g. 5m, 15m, 1h, 4h, 1d)"))?;
-                level = Some(
-                    Level::from_str(value.as_ref())
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                );
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--level requires a value (e.g. 5m, 15m, 1h, 4h, 1d)")
+                })?;
+                level = Some(Level::from_str(value.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?);
             }
             "--pair" => {
                 let value = iter
@@ -170,9 +167,9 @@ where
                 pair = Some(parse_pair_value(value.as_ref())?);
             }
             "--threads" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--threads requires a value (positive integer or 0 for auto)"))?;
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--threads requires a value (positive integer or 0 for auto)")
+                })?;
                 threads = Some(parse_threads_value(value.as_ref())?);
             }
             "--data-dir" => {
@@ -327,9 +324,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Precision: {}", selected.precision);
     println!(
         "Best result: sharpe: {:.6}, max_dd: {:.4}, params: {}",
-        selected.best.metrics.sharpe_ratio,
-        selected.best.metrics.max_drawdown,
-        params_summary,
+        selected.best.metrics.sharpe_ratio, selected.best.metrics.max_drawdown, params_summary,
     );
     println!(
         "Final portfolio value: {:.3}$",
@@ -422,7 +417,11 @@ mod tests {
         assert_eq!(cli2.level, Some(Level::Month1), "1M (capital) is monthly");
 
         let cli3 = parse_cli_args(["--level", "1m"]).unwrap();
-        assert_eq!(cli3.level, Some(Level::Minute1), "1m (lowercase) is one-minute");
+        assert_eq!(
+            cli3.level,
+            Some(Level::Minute1),
+            "1m (lowercase) is one-minute"
+        );
     }
 
     #[test]
@@ -432,8 +431,7 @@ mod tests {
 
     #[test]
     fn parse_cli_args_reads_pair_and_threads() {
-        let cli =
-            parse_cli_args(["--pair", "eth-usdt", "--threads", "8"]).unwrap();
+        let cli = parse_cli_args(["--pair", "eth-usdt", "--threads", "8"]).unwrap();
         assert_eq!(cli.pair, Some("ETH-USDT".to_string()), "pair upper-cased");
         assert_eq!(cli.threads, Some(8));
     }
@@ -442,7 +440,10 @@ mod tests {
     fn parse_cli_args_threads_zero_means_auto() {
         let cli = parse_cli_args(["--threads", "0"]).unwrap();
         let threads = cli.threads.unwrap();
-        assert!(threads >= 1, "auto must resolve to at least 1, got {threads}");
+        assert!(
+            threads >= 1,
+            "auto must resolve to at least 1, got {threads}"
+        );
     }
 
     #[test]
