@@ -1,16 +1,29 @@
-use crate::data::{data_file_path, legacy_json_path};
-use crate::exchange::{get_k_range, Binance, Level, TimeRange, K};
+use crate::data::DataPaths;
+use crate::exchange::{get_k_range, Binance, KlineProvider, Level, TimeRange, K};
 use crate::feather;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_MAX_AGE_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+/// A cache goes stale once its newest candle is this many bar intervals behind
+/// the wall clock — i.e. as soon as a newer candle has certainly closed. A flat
+/// wall-clock threshold would let a 15m backtest silently run on data hundreds
+/// of candles old.
+const CACHE_MAX_AGE_BARS: u64 = 2;
+/// Floor for the above, so 1m data does not re-hit the API every other minute.
+const CACHE_MIN_MAX_AGE_MS: u64 = 2 * 60 * 1000;
 
-pub fn load_k_lines(pair: &str, level: &Level) -> Result<Vec<K>> {
-    let datafile = data_file_path(pair, level);
-    let legacy = legacy_json_path(pair, level);
+fn cache_max_age_ms(level: Level) -> u64 {
+    level
+        .approx_duration_ms()
+        .saturating_mul(CACHE_MAX_AGE_BARS)
+        .max(CACHE_MIN_MAX_AGE_MS)
+}
+
+pub fn load_k_lines(paths: &DataPaths, pair: &str, level: &Level) -> Result<Vec<K>> {
+    let datafile = paths.feather(pair, level);
+    let legacy = paths.legacy_json(pair, level);
     if !datafile.exists() && legacy.exists() {
         migrate_legacy_json(&legacy, &datafile).with_context(|| {
             format!(
@@ -55,18 +68,36 @@ impl NormalizeReport {
     }
 }
 
-/// Sort candles ascending by timestamp and drop duplicates by timestamp.
-/// Returns a `NormalizeReport` describing what was fixed.
+/// Sort candles ascending by timestamp and drop duplicates by timestamp,
+/// **keeping the last** occurrence of each. Returns a `NormalizeReport`
+/// describing what was fixed.
+///
+/// "Last wins" is load-bearing, not a detail: the merge in
+/// `download_dump_k_lines` appends freshly downloaded candles after the cached
+/// ones and deliberately re-fetches the newest cached candle, so keeping the
+/// later copy is what lets a stale bar be corrected. Keeping the first would
+/// pin the stale copy forever.
 pub fn normalize_klines(v: &mut Vec<K>) -> NormalizeReport {
     if v.len() <= 1 {
         return NormalizeReport::default();
     }
     let was_unsorted = v.windows(2).any(|w| w[0].time > w[1].time);
     if was_unsorted {
+        // Stable, so equal timestamps keep their relative (cached-then-fresh)
+        // order and the dedup below can rely on "later in the vector is newer".
         v.sort_by_key(|k| k.time);
     }
     let before = v.len();
-    v.dedup_by_key(|k| k.time);
+    // `dedup_by` hands over (later, earlier) and drops the later one; copying
+    // the later into the retained slot first turns it into "keep the last".
+    v.dedup_by(|later, earlier| {
+        if later.time == earlier.time {
+            *earlier = *later;
+            true
+        } else {
+            false
+        }
+    });
     NormalizeReport {
         was_unsorted,
         removed_duplicates: before - v.len(),
@@ -162,7 +193,9 @@ pub fn migrate_legacy_json(legacy: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refresh the on-disk cache for `(product, level)` from Binance.
 pub async fn download_dump_k_lines<T>(
+    paths: &DataPaths,
     product: &str,
     level: Level,
     range: T,
@@ -171,12 +204,30 @@ pub async fn download_dump_k_lines<T>(
 where
     T: Into<TimeRange>,
 {
-    let folder_path = Path::new("dataKLines");
+    let exchange = Binance::new().context("Failed to create Binance client")?;
+    download_with_provider(&exchange, paths, product, level, range, force).await
+}
+
+/// The body of [`download_dump_k_lines`], with the data source injected so the
+/// cache-merge behaviour can be tested without touching the network.
+pub async fn download_with_provider<P, T>(
+    provider: &P,
+    paths: &DataPaths,
+    product: &str,
+    level: Level,
+    range: T,
+    force: bool,
+) -> Result<()>
+where
+    P: KlineProvider,
+    T: Into<TimeRange>,
+{
+    let folder_path = paths.klines_dir();
     fs::create_dir_all(folder_path)
         .with_context(|| format!("Failed to create directory: {}", folder_path.display()))?;
 
-    let cache_path = data_file_path(product, &level);
-    let legacy = legacy_json_path(product, &level);
+    let cache_path = paths.feather(product, &level);
+    let legacy = paths.legacy_json(product, &level);
     if !cache_path.exists() && legacy.exists() {
         migrate_legacy_json(&legacy, &cache_path).with_context(|| {
             format!(
@@ -205,7 +256,7 @@ where
         match feather::read_last_time(&cache_path) {
             Ok(last_ms) => {
                 let age_ms = now_ms.saturating_sub(last_ms);
-                if is_cache_fresh(last_ms, now_ms, CACHE_MAX_AGE_MS) {
+                if is_cache_fresh(last_ms, now_ms, cache_max_age_ms(level)) {
                     println!(
                         "File {:?} is up to date (last candle ~{}h old). Skip Download.",
                         cache_path,
@@ -216,14 +267,18 @@ where
                 match feather::read(&cache_path) {
                     Ok(prev) => {
                         println!(
-                            "File {:?} last candle is ~{}h old; fetching delta from {} onward...",
+                            "File {:?} last candle is ~{}h old; fetching delta from {last_ms} onward...",
                             cache_path,
                             age_ms / 3_600_000,
-                            last_ms + 1
                         );
                         existing = Some(prev);
+                        // Deliberately restart *at* the newest cached candle
+                        // rather than one millisecond past it: older versions
+                        // of this program stored the still-forming candle, and
+                        // re-reading it lets `normalize_klines` replace that
+                        // stale copy with the finished one.
                         TimeRange {
-                            start: last_ms + 1,
+                            start: last_ms,
                             end: range.end,
                         }
                     }
@@ -246,8 +301,7 @@ where
         }
     };
 
-    let exchange = Binance::new().context("Failed to create Binance client")?;
-    let mut new_batch = get_k_range(&exchange, product, level, download_range)
+    let mut new_batch = get_k_range(provider, product, level, download_range)
         .await
         .with_context(|| format!("Failed to download candlesticks for {product} {level}"))?;
     new_batch.reverse();
@@ -308,14 +362,39 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp(label: &str, ext: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("backtest_rust_dl_{label}_{}.{ext}", unique_suffix()))
+    }
+
+    fn unique_suffix() -> String {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "backtest_rust_dl_{label}_{}_{stamp}.{ext}",
-            std::process::id()
-        ))
+        format!("{}_{stamp}", std::process::id())
+    }
+
+    /// A scratch `DataPaths` under the system temp dir, removed on drop, so no
+    /// test touches the repository's live `dataKLines/` or depends on the
+    /// process working directory.
+    struct TempPaths {
+        root: std::path::PathBuf,
+        paths: DataPaths,
+    }
+
+    impl TempPaths {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("backtest_rust_paths_{label}_{}", unique_suffix()));
+            let paths = DataPaths::new(root.join("dataKLines"), root.join("results"));
+            fs::create_dir_all(paths.klines_dir()).unwrap();
+            Self { root, paths }
+        }
+    }
+
+    impl Drop for TempPaths {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn small_klines(times: &[u64]) -> Vec<K> {
@@ -527,33 +606,24 @@ mod tests {
 
     #[test]
     fn load_k_lines_round_trips_through_feather() {
-        // Drive load_k_lines via a fake (pair, level) by writing to a known
-        // path. Use a pair name unlikely to collide with anything else; we
-        // operate inside the CWD's `dataKLines/` so this is best-effort.
-        let pair = format!("__test_load_{}", std::process::id());
+        let temp = TempPaths::new("round_trip");
         let level = Level::Hour1;
-        let path = data_file_path(&pair, &level);
-        let _ = fs::create_dir_all(path.parent().unwrap());
         let candles = small_klines(&[1, 2, 3, 4]);
-        feather::write(&path, &candles).unwrap();
+        feather::write(&temp.paths.feather("ANY-USDT", &level), &candles).unwrap();
 
-        let loaded = load_k_lines(&pair, &level).expect("load succeeds");
+        let loaded = load_k_lines(&temp.paths, "ANY-USDT", &level).expect("load succeeds");
         assert_eq!(loaded, candles);
-
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn load_k_lines_normalizes_and_rewrites_in_place() {
-        let pair = format!("__test_load_norm_{}", std::process::id());
+        let temp = TempPaths::new("normalize");
         let level = Level::Hour1;
-        let path = data_file_path(&pair, &level);
-        let _ = fs::create_dir_all(path.parent().unwrap());
         // Out-of-order with one duplicate timestamp.
         let candles = small_klines(&[3, 1, 2, 1]);
-        feather::write(&path, &candles).unwrap();
+        feather::write(&temp.paths.feather("ANY-USDT", &level), &candles).unwrap();
 
-        let loaded = load_k_lines(&pair, &level).expect("load succeeds");
+        let loaded = load_k_lines(&temp.paths, "ANY-USDT", &level).expect("load succeeds");
         assert_eq!(
             loaded.iter().map(|k| k.time).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -561,29 +631,159 @@ mod tests {
 
         // Re-read from disk; should already be normalized so the second load
         // does not trigger another rewrite.
-        let again = load_k_lines(&pair, &level).expect("second load");
+        let again = load_k_lines(&temp.paths, "ANY-USDT", &level).expect("second load");
         assert_eq!(again, loaded);
-
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
     fn load_k_lines_migrates_legacy_json_when_feather_absent() {
-        let pair = format!("__test_load_legacy_{}", std::process::id());
+        let temp = TempPaths::new("legacy");
         let level = Level::Hour1;
-        let target = data_file_path(&pair, &level);
-        let legacy = legacy_json_path(&pair, &level);
-        let _ = fs::create_dir_all(target.parent().unwrap());
-        let _ = fs::remove_file(&target);
+        let target = temp.paths.feather("ANY-USDT", &level);
+        let legacy = temp.paths.legacy_json("ANY-USDT", &level);
 
         let candles = small_klines(&[5, 6, 7]);
         fs::write(&legacy, serde_json::to_string(&candles).unwrap()).unwrap();
 
-        let loaded = load_k_lines(&pair, &level).expect("load succeeds via migration");
+        let loaded =
+            load_k_lines(&temp.paths, "ANY-USDT", &level).expect("load succeeds via migration");
         assert_eq!(loaded, candles);
         assert!(target.exists(), "feather should appear after migration");
         assert!(!legacy.exists(), "legacy json should be cleaned up");
+    }
 
-        let _ = fs::remove_file(&target);
+    #[test]
+    fn normalize_klines_keeps_the_newest_row_for_a_duplicate_timestamp() {
+        // Mirrors the incremental-download merge: the cached copy of candle
+        // `2` came first and is stale, the re-fetched copy came second and is
+        // the finished bar. The finished bar must win.
+        let mut v = vec![
+            K { time: 1, open: 1.0, high: 1.0, low: 1.0, close: 1.0 },
+            K { time: 2, open: 9.0, high: 9.0, low: 9.0, close: 9.0 }, // stale
+            K { time: 2, open: 5.0, high: 7.0, low: 3.0, close: 6.0 }, // fresh
+        ];
+        let report = normalize_klines(&mut v);
+        assert_eq!(report.removed_duplicates, 1);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].close, 6.0, "the later (freshly downloaded) row wins");
+        assert_eq!(v[1].high, 7.0);
+    }
+
+    /// Returns one canned page, newest-first, then nothing.
+    struct OnePageProvider {
+        page: Vec<K>,
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    impl OnePageProvider {
+        fn new(page: Vec<K>) -> Self {
+            Self {
+                page,
+                served: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::exchange::KlineProvider for OnePageProvider {
+        #[allow(clippy::manual_async_fn)]
+        fn get_k(
+            &self,
+            _product: &str,
+            _level: Level,
+            _time: u64,
+        ) -> impl std::future::Future<Output = Result<Vec<K>>> + Send + '_ {
+            async move {
+                if self
+                    .served
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Ok(Vec::new());
+                }
+                Ok(self.page.clone())
+            }
+        }
+    }
+
+    fn candle(time: u64, close: f32) -> K {
+        K { time, open: close, high: close, low: close, close }
+    }
+
+    #[tokio::test]
+    async fn incremental_download_repairs_a_stale_final_candle() {
+        // The regression this covers end to end: an older build wrote the
+        // still-forming candle into the cache. The delta fetch must re-read
+        // that bar and the merge must keep the finished copy.
+        let temp = TempPaths::new("repair");
+        let level = Level::Hour1;
+        let hour = 3_600_000u64;
+        let now = now_unix_millis().unwrap();
+        // Align to an hour boundary well in the past so every candle is closed.
+        let newest_open = (now / hour) * hour - 5 * hour;
+        let older_open = newest_open - hour;
+
+        let stale_cache = vec![candle(older_open, 100.0), candle(newest_open, 111.0)];
+        feather::write(&temp.paths.feather("ANY-USDT", &level), &stale_cache).unwrap();
+
+        // The exchange's version of the same bar, plus one genuinely new bar.
+        let provider = OnePageProvider::new(vec![
+            candle(newest_open + hour, 222.0),
+            candle(newest_open, 999.0),
+        ]);
+
+        download_with_provider(
+            &provider,
+            &temp.paths,
+            "ANY-USDT",
+            level,
+            0u64..,
+            false,
+        )
+        .await
+        .expect("incremental download succeeds");
+
+        let merged = feather::read(&temp.paths.feather("ANY-USDT", &level)).unwrap();
+        assert_eq!(merged.len(), 3, "one bar appended, none duplicated");
+        assert_eq!(
+            merged[1].close, 999.0,
+            "the re-fetched copy must overwrite the stale cached one"
+        );
+        assert_eq!(merged[2].close, 222.0, "the new bar is appended");
+    }
+
+    #[tokio::test]
+    async fn download_refuses_to_replace_a_cache_with_nothing() {
+        let temp = TempPaths::new("empty");
+        let provider = OnePageProvider::new(Vec::new());
+        let result = download_with_provider(
+            &provider,
+            &temp.paths,
+            "ANY-USDT",
+            Level::Hour1,
+            0u64..,
+            true,
+        )
+        .await;
+        assert!(result.is_err(), "an empty download must not truncate data");
+    }
+
+    #[test]
+    fn cache_max_age_scales_with_the_interval() {
+        assert_eq!(cache_max_age_ms(Level::Day1), 2 * 86_400_000);
+        assert_eq!(cache_max_age_ms(Level::Minute15), 2 * 15 * 60_000);
+        assert_eq!(
+            cache_max_age_ms(Level::Minute1),
+            CACHE_MIN_MAX_AGE_MS,
+            "the floor keeps 1m data from re-hitting the API constantly"
+        );
+    }
+
+    #[test]
+    fn a_15m_cache_two_days_old_is_no_longer_considered_fresh() {
+        // The regression this replaces: a flat two-day threshold let a 15m
+        // backtest run on data ~192 candles stale.
+        let now = 10 * 86_400_000u64;
+        let last = now - 86_400_000; // one day behind
+        assert!(!is_cache_fresh(last, now, cache_max_age_ms(Level::Minute15)));
+        assert!(is_cache_fresh(last, now, cache_max_age_ms(Level::Day1)));
     }
 }

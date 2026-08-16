@@ -36,6 +36,9 @@ pub struct EngineConfig {
     pub threads: usize,
     pub starting_capital: f32,
     pub fee_rate: f32,
+    /// Per-**bar** risk-free rate subtracted from returns before the Sharpe
+    /// ratio is computed. Usually 0.
+    pub risk_free_rate: f32,
     pub execution_model: ExecutionModel,
     pub show_progress: bool,
     pub progress_step: usize,
@@ -54,6 +57,7 @@ pub struct NumericBacktestConfig<T> {
     pub periods_per_year: usize,
     pub starting_capital: T,
     pub fee_rate: T,
+    pub risk_free_rate: T,
     pub execution_model: ExecutionModel,
 }
 
@@ -142,6 +146,7 @@ fn numeric_backtest_config<T: BacktestFloat>(
         periods_per_year: periods_per_year(engine.level),
         starting_capital: T::from_f32(engine.starting_capital),
         fee_rate: T::from_f32(engine.fee_rate),
+        risk_free_rate: T::from_f32(engine.risk_free_rate),
         execution_model: engine.execution_model,
     }
 }
@@ -156,15 +161,18 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
     params: S::Params,
     cfg: NumericBacktestConfig<T>,
 ) -> BacktestMetrics {
-    if close.is_empty() || open.len() != close.len() {
+    // `run` rejects mismatched inputs up front; the assert keeps that contract
+    // visible here, and the `min` keeps a release build safely truncating
+    // rather than indexing past an end.
+    debug_assert_eq!(open.len(), close.len(), "open/close length mismatch");
+    let n = open.len().min(close.len());
+    if n == 0 {
         return BacktestMetrics {
             final_value: cfg.starting_capital.to_f64(),
             max_drawdown: 0.0,
             sharpe_ratio: 0.0,
         };
     }
-
-    let n = close.len();
     let evaluator = S::evaluator::<T>(cache, params);
 
     let mut usdt: T = cfg.starting_capital;
@@ -180,9 +188,9 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
     // through bounds-check-free iterators. The strategy's `evaluator` reads
     // `bar_index` (the lookback) directly from its hoisted slices.
     let trades = match cfg.execution_model {
-        ExecutionModel::NextOpen => &open[1..],
+        ExecutionModel::NextOpen => &open[1..n],
     };
-    let marks = &close[1..];
+    let marks = &close[1..n];
 
     for (bar_index, (&trade_price, &mark_price)) in
         trades.iter().zip(marks.iter()).enumerate()
@@ -215,7 +223,7 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
 
     let final_value = portfolio_values.last().copied().unwrap().to_f64();
     let max_drawdown = max_drawdown(&portfolio_values);
-    let sharpe = sharpe_ratio(&returns, T::ZERO, cfg.periods_per_year);
+    let sharpe = sharpe_ratio(&returns, cfg.risk_free_rate, cfg.periods_per_year);
 
     let metrics = BacktestMetrics {
         final_value,
@@ -316,6 +324,23 @@ pub fn run<S: Strategy>(
     strategy_config: &S::Config,
     market: &CandleSeries,
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
+    // A length mismatch means the loader or the caller is broken. Failing here
+    // is the whole point: silently backtesting the shorter prefix would return
+    // a plausible-looking result for data that does not exist.
+    if market.open_prices.len() != market.close_prices.len() {
+        anyhow::bail!(
+            "malformed market data: {} open prices but {} close prices",
+            market.open_prices.len(),
+            market.close_prices.len()
+        );
+    }
+    if market.close_prices.len() < 2 {
+        anyhow::bail!(
+            "not enough candles to backtest: {} (need at least 2)",
+            market.close_prices.len()
+        );
+    }
+
     let pool = ThreadPoolBuilder::new()
         .num_threads(engine.threads)
         .build()
@@ -347,6 +372,7 @@ mod tests {
             periods_per_year: periods_per_year(Level::Hour4),
             starting_capital: T::from_f32(starting),
             fee_rate: T::from_f32(0.0015),
+            risk_free_rate: T::ZERO,
             execution_model: ExecutionModel::NextOpen,
         }
     }

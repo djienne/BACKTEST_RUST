@@ -25,6 +25,10 @@ pub fn max_drawdown<T: BacktestFloat>(portfolio_values: &[T]) -> f64 {
     max_drawdown.to_f64() * 100.0
 }
 
+/// Annualized Sharpe ratio of a per-period return series.
+///
+/// `risk_free_rate` is a **per-period** rate, in the same units as `returns`.
+/// Annualization scales the per-period ratio by `sqrt(periods_per_year)`.
 pub fn sharpe_ratio<T: BacktestFloat>(
     returns: &[T],
     risk_free_rate: T,
@@ -40,6 +44,7 @@ pub fn sharpe_ratio<T: BacktestFloat>(
         .copied()
         .fold(T::ZERO, |acc, value| acc + value)
         / count;
+    // Sample variance (Bessel-corrected).
     let variance = returns
         .iter()
         .copied()
@@ -49,13 +54,23 @@ pub fn sharpe_ratio<T: BacktestFloat>(
         })
         .fold(T::ZERO, |acc, value| acc + value)
         / T::from_usize(returns.len() - 1);
-    let annualized_std_dev = variance.sqrt() / T::from_usize(periods_per_year).sqrt();
 
-    if !annualized_std_dev.is_finite() || annualized_std_dev <= T::ZERO {
-        0.0
-    } else {
-        ((mean_return - risk_free_rate) / annualized_std_dev).to_f64()
+    annualize_sharpe(
+        (mean_return - risk_free_rate).to_f64(),
+        variance.to_f64(),
+        periods_per_year,
+    )
+}
+
+/// Shared tail of every Sharpe computation: guard the degenerate cases, then
+/// scale the per-period ratio to a yearly one. Split out so the streaming
+/// accumulator in the sweep and the slice form above cannot drift apart.
+pub fn annualize_sharpe(mean_excess_return: f64, variance: f64, periods_per_year: usize) -> f64 {
+    let std_dev = variance.sqrt();
+    if !std_dev.is_finite() || std_dev <= 0.0 || !mean_excess_return.is_finite() {
+        return 0.0;
     }
+    mean_excess_return / std_dev * (periods_per_year as f64).sqrt()
 }
 
 #[cfg(test)]
@@ -120,5 +135,22 @@ mod tests {
         let s_no_rf = sharpe_ratio(&r, 0.0, 252);
         let s_rf = sharpe_ratio(&r, 0.005, 252);
         assert!(s_no_rf > s_rf, "{s_no_rf} should exceed {s_rf}");
+    }
+
+    #[test]
+    fn annualize_sharpe_scales_by_the_root_of_the_period_count() {
+        // Doubling the periods per year multiplies the ratio by sqrt(2).
+        let one = annualize_sharpe(0.01, 0.0001, 252);
+        let two = annualize_sharpe(0.01, 0.0001, 504);
+        assert!((two / one - 2.0_f64.sqrt()).abs() < 1e-12);
+        assert!((one - 0.01 / 0.01 * 252.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn annualize_sharpe_guards_degenerate_inputs() {
+        assert_eq!(annualize_sharpe(0.01, 0.0, 252), 0.0, "zero variance");
+        assert_eq!(annualize_sharpe(0.01, f64::NAN, 252), 0.0);
+        assert_eq!(annualize_sharpe(f64::NAN, 0.0001, 252), 0.0);
+        assert_eq!(annualize_sharpe(0.01, -1.0, 252), 0.0, "negative variance");
     }
 }

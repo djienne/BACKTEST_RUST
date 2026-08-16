@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
-use backtest_rust::data::{data_file_path, load_data_file, results_file_path};
+use backtest_rust::data::{load_data_file, DataPaths};
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 use backtest_rust::output::{write_to_file, ResultRow};
@@ -28,6 +28,7 @@ fn default_engine_config() -> EngineConfig {
         threads: 1,
         starting_capital: 1000.0,
         fee_rate: 0.0015,
+        risk_free_rate: 0.0,
         execution_model: ExecutionModel::NextOpen,
         show_progress: true,
         progress_step: 10_000,
@@ -72,6 +73,21 @@ struct CliOpts {
     level: Option<Level>,
     pair: Option<String>,
     threads: Option<usize>,
+    data_dir: Option<String>,
+    results_dir: Option<String>,
+}
+
+impl CliOpts {
+    fn data_paths(&self) -> DataPaths {
+        let mut paths = DataPaths::default();
+        if let Some(dir) = &self.data_dir {
+            paths = paths.with_klines_dir(dir);
+        }
+        if let Some(dir) = &self.results_dir {
+            paths = paths.with_results_dir(dir);
+        }
+        paths
+    }
 }
 
 fn parse_pair_value(value: &str) -> anyhow::Result<String> {
@@ -124,6 +140,8 @@ where
     let mut level: Option<Level> = None;
     let mut pair: Option<String> = None;
     let mut threads: Option<usize> = None;
+    let mut data_dir: Option<String> = None;
+    let mut results_dir: Option<String> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -157,6 +175,18 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--threads requires a value (positive integer or 0 for auto)"))?;
                 threads = Some(parse_threads_value(value.as_ref())?);
             }
+            "--data-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--data-dir requires a path"))?;
+                data_dir = Some(value.as_ref().to_string());
+            }
+            "--results-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--results-dir requires a path"))?;
+                results_dir = Some(value.as_ref().to_string());
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -172,6 +202,8 @@ where
         level,
         pair,
         threads,
+        data_dir,
+        results_dir,
     })
 }
 
@@ -186,6 +218,8 @@ fn print_usage() {
            --threads <N>         Rayon worker threads; 0 = auto (default: 1)\n  \
            --force               Bypass the freshness guard and re-download\n  \
            --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)\n  \
+           --data-dir <PATH>     Kline cache directory (default: dataKLines)\n  \
+           --results-dir <PATH>  Results CSV directory (default: results)\n  \
            -h, --help            Show this message\n\n\
          Environment variables:\n  \
            BACKTEST_SHOW_PROGRESS=0|1   Toggle per-iteration progress log\n  \
@@ -231,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(level) = cli.level {
         engine.level = level;
     }
-    if let Some(pair) = cli.pair {
+    if let Some(pair) = cli.pair.clone() {
         engine.pair = Cow::Owned(pair);
     }
     if let Some(threads) = cli.threads {
@@ -241,9 +275,11 @@ async fn main() -> anyhow::Result<()> {
     let env_force = read_env_bool("BACKTEST_FORCE_DOWNLOAD")?.unwrap_or(false);
     let force = cli.force_download || env_force || cli.mode == RunMode::DownloadOnly;
 
-    let data_file = data_file_path(&engine.pair, &engine.level);
+    let paths = cli.data_paths();
+    let data_file = paths.feather(&engine.pair, &engine.level);
 
     let download_result = download_dump_k_lines(
+        &paths,
         &engine.pair,
         engine.level,
         engine.download_start..,
@@ -279,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Doing: {} {}", engine.pair, engine.level);
-    let market = load_data_file(&engine.pair, &engine.level)?;
+    let market = load_data_file(&paths, &engine.pair, &engine.level)?;
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
@@ -304,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
     let ohlcv_file = format!("{}-{}", engine.pair, engine.level);
     let precision = selected.precision.to_string();
     write_to_file(
-        &results_file_path(&engine.pair, &engine.level),
+        &paths.results(&engine.pair, &engine.level),
         &ResultRow {
             ohlcv_file: &ohlcv_file,
             precision: &precision,

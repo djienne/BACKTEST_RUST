@@ -7,7 +7,7 @@
 //! they are compared with a precision-dependent tolerance rather than exactly.
 
 use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
-use backtest_rust::data::load_data_file;
+use backtest_rust::data::{load_data_file, DataPaths};
 use backtest_rust::exchange::Level;
 use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
 use std::borrow::Cow;
@@ -30,6 +30,7 @@ fn engine() -> EngineConfig {
         threads: 4,
         starting_capital: 1000.0,
         fee_rate: 0.0015,
+        risk_free_rate: 0.0,
         execution_model: ExecutionModel::NextOpen,
         show_progress: false,
         progress_step: 100_000,
@@ -47,7 +48,8 @@ fn strategy() -> DoubleEmaConfig {
 
 #[test]
 fn double_ema_sweep_matches_the_recorded_baseline() {
-    let market = load_data_file("BTC-USDT", &Level::Hour4).expect("fixture data should load");
+    let market = load_data_file(&DataPaths::default(), "BTC-USDT", &Level::Hour4)
+        .expect("fixture data should load");
     let selected = run::<DoubleEmaCrossover>(&engine(), &strategy(), &market).unwrap();
     let m = selected.best.metrics;
 

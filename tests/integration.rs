@@ -33,6 +33,7 @@ fn small_engine() -> EngineConfig {
         threads: 2,
         starting_capital: 1000.0,
         fee_rate: 0.0015,
+        risk_free_rate: 0.0,
         execution_model: ExecutionModel::NextOpen,
         show_progress: false,
         progress_step: 100,

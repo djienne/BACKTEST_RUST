@@ -10,27 +10,71 @@ pub struct CandleSeries {
     pub close_prices: Vec<f32>,
 }
 
-pub fn data_file_path(pair: &str, level: &Level) -> PathBuf {
-    Path::new("dataKLines").join(format!("{pair}-{level}.feather"))
+/// Where the program reads and writes. Passed explicitly rather than baked in
+/// as process-relative constants, so tests can point at a scratch directory
+/// instead of the repository's live `dataKLines/`, and so the CLI can offer
+/// `--data-dir` / `--results-dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataPaths {
+    klines_dir: PathBuf,
+    results_dir: PathBuf,
 }
 
-/// Path of the legacy JSON cache file for `(pair, level)`. Used by the
-/// one-time migration helper in `download.rs` so existing JSON caches are
-/// converted in place rather than forcing a full re-download.
-pub fn legacy_json_path(pair: &str, level: &Level) -> PathBuf {
-    Path::new("dataKLines").join(format!("{pair}-{level}.json"))
+impl DataPaths {
+    pub fn new(klines_dir: impl Into<PathBuf>, results_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            klines_dir: klines_dir.into(),
+            results_dir: results_dir.into(),
+        }
+    }
+
+    pub fn klines_dir(&self) -> &Path {
+        &self.klines_dir
+    }
+
+    #[must_use]
+    pub fn with_klines_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.klines_dir = dir.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_results_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.results_dir = dir.into();
+        self
+    }
+
+    /// Cached market data for `(pair, level)` — Apache Arrow IPC / Feather v2.
+    pub fn feather(&self, pair: &str, level: &Level) -> PathBuf {
+        self.klines_dir.join(format!("{pair}-{level}.feather"))
+    }
+
+    /// Legacy JSON cache path, read once by the migration helper in
+    /// `download.rs` so an existing JSON cache is converted rather than
+    /// forcing a full re-download.
+    pub fn legacy_json(&self, pair: &str, level: &Level) -> PathBuf {
+        self.klines_dir.join(format!("{pair}-{level}.json"))
+    }
+
+    /// Appended run history for `(pair, level)`.
+    ///
+    /// The `_v2` suffix isolates the Strategy/Params CSV schema from older
+    /// Period1/Period2 files — `write_to_file` only emits a header for an
+    /// empty or missing target, so appending to an old file would silently
+    /// interleave two schemas.
+    pub fn results(&self, pair: &str, level: &Level) -> PathBuf {
+        self.results_dir.join(format!("{pair}-{level}_v2.csv"))
+    }
 }
 
-pub fn results_file_path(pair: &str, level: &Level) -> PathBuf {
-    // `_v2` suffix isolates the new Strategy/Params CSV schema from any old
-    // Period1/Period2 results files that already exist in `results/` —
-    // `write_to_file` only writes the header for empty/missing targets, so
-    // appending to an old file would silently mix two schemas.
-    Path::new("results").join(format!("{pair}-{level}_v2.csv"))
+impl Default for DataPaths {
+    fn default() -> Self {
+        Self::new("dataKLines", "results")
+    }
 }
 
-pub fn load_data_file(pair: &str, level: &Level) -> Result<CandleSeries> {
-    let k_v = load_k_lines(pair, level)?;
+pub fn load_data_file(paths: &DataPaths, pair: &str, level: &Level) -> Result<CandleSeries> {
+    let k_v = load_k_lines(paths, pair, level)?;
     let mut timestamps = Vec::with_capacity(k_v.len());
     let mut open_prices = Vec::with_capacity(k_v.len());
     let mut close_prices = Vec::with_capacity(k_v.len());
@@ -52,9 +96,27 @@ mod tests {
 
     #[test]
     fn load_data_file_reads_repository_fixture() {
-        let candles = load_data_file("BTC-USDT", &Level::Hour4).expect("fixture data should load");
+        let candles = load_data_file(&DataPaths::default(), "BTC-USDT", &Level::Hour4)
+            .expect("fixture data should load");
         assert_eq!(candles.timestamps.len(), candles.close_prices.len());
         assert_eq!(candles.timestamps.len(), candles.open_prices.len());
         assert!(!candles.timestamps.is_empty());
+    }
+
+    #[test]
+    fn data_paths_compose_file_names_under_their_roots() {
+        let paths = DataPaths::new("some/klines", "some/results");
+        assert_eq!(
+            paths.feather("BTC-USDT", &Level::Hour4),
+            Path::new("some/klines").join("BTC-USDT-4h.feather")
+        );
+        assert_eq!(
+            paths.legacy_json("BTC-USDT", &Level::Hour4),
+            Path::new("some/klines").join("BTC-USDT-4h.json")
+        );
+        assert_eq!(
+            paths.results("BTC-USDT", &Level::Hour4),
+            Path::new("some/results").join("BTC-USDT-4h_v2.csv")
+        );
     }
 }

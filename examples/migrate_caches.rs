@@ -3,6 +3,7 @@
 //!
 //! Run: `cargo run --release --example migrate_caches`
 
+use backtest_rust::data::DataPaths;
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
 
@@ -22,9 +23,10 @@ async fn main() -> anyhow::Result<()> {
         Level::Hour12,
     ];
 
+    let paths = DataPaths::default();
     for level in levels {
         println!("\n=== Re-downloading {PAIR} {level} ===");
-        if let Err(error) = download_dump_k_lines(PAIR, level, SINCE_MS.., true).await {
+        if let Err(error) = download_dump_k_lines(&paths, PAIR, level, SINCE_MS.., true).await {
             eprintln!("FAILED for {level}: {error:#}");
         }
     }

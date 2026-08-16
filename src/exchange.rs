@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::{Months, TimeZone, Utc};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::ops::{Range, RangeFrom, RangeFull, RangeInclusive};
@@ -6,6 +8,14 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const INTER_PAGE_DELAY_MS: u64 = 50;
+const BINANCE_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
+/// A 1500-candle page over a slow link needs more than the 5s this used to use.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_RETRIES: u32 = 4;
+const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
+/// Upper bound on a server-supplied `Retry-After`, so a hostile or mistaken
+/// header cannot park the whole download for hours.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 
 // All variants are reachable via the `--level` CLI flag (see `Level::FromStr`).
 // The binary defaults to `Minute15`.
@@ -46,6 +56,65 @@ impl Level {
             Level::Month1 => "1M",
         }
     }
+
+    /// Exact bar duration in milliseconds, or `None` for `Month1` — calendar
+    /// months are 28–31 days, so that one needs date arithmetic instead
+    /// (see [`candle_close_time_ms`]).
+    pub fn fixed_duration_ms(self) -> Option<u64> {
+        const MINUTE: u64 = 60_000;
+        const HOUR: u64 = 60 * MINUTE;
+        const DAY: u64 = 24 * HOUR;
+        Some(match self {
+            Level::Minute1 => MINUTE,
+            Level::Minute3 => 3 * MINUTE,
+            Level::Minute5 => 5 * MINUTE,
+            Level::Minute15 => 15 * MINUTE,
+            Level::Minute30 => 30 * MINUTE,
+            Level::Hour1 => HOUR,
+            Level::Hour2 => 2 * HOUR,
+            Level::Hour4 => 4 * HOUR,
+            Level::Hour6 => 6 * HOUR,
+            Level::Hour12 => 12 * HOUR,
+            Level::Day1 => DAY,
+            Level::Day3 => 3 * DAY,
+            Level::Week1 => 7 * DAY,
+            Level::Month1 => return None,
+        })
+    }
+
+    /// Bar duration for heuristics that only need an order of magnitude
+    /// (cache-freshness thresholds). `Month1` is approximated as 30 days.
+    pub fn approx_duration_ms(self) -> u64 {
+        self.fixed_duration_ms().unwrap_or(30 * 24 * 60 * 60 * 1000)
+    }
+}
+
+/// Close time of the candle that opens at `open_ms` — i.e. the open time of the
+/// following candle. `None` when the timestamp is not representable as a date,
+/// which callers must treat as "unknown", never as "closed".
+pub fn candle_close_time_ms(level: Level, open_ms: u64) -> Option<u64> {
+    match level.fixed_duration_ms() {
+        Some(duration) => open_ms.checked_add(duration),
+        None => {
+            let opened = Utc
+                .timestamp_millis_opt(i64::try_from(open_ms).ok()?)
+                .single()?;
+            let next = opened.checked_add_months(Months::new(1))?;
+            u64::try_from(next.timestamp_millis()).ok()
+        }
+    }
+}
+
+/// Whether the candle opening at `open_ms` has finished forming by `now_ms`.
+///
+/// Binance happily returns the **currently forming** candle, whose OHLC is
+/// still moving. Writing that into the cache freezes a half-formed bar into
+/// history, so the download path drops anything this returns `false` for.
+/// Unknown timestamps are reported as closed: keeping a suspect candle is
+/// recoverable (the next incremental fetch re-reads and replaces it), whereas
+/// silently dropping real data is not.
+pub fn candle_is_closed(level: Level, open_ms: u64, now_ms: u64) -> bool {
+    candle_close_time_ms(level, open_ms).is_none_or(|close_ms| close_ms <= now_ms)
 }
 
 impl std::fmt::Display for Level {
@@ -153,15 +222,136 @@ pub trait KlineProvider {
 #[derive(Debug, Clone)]
 pub struct Binance {
     client: reqwest::Client,
+    max_retries: u32,
+    base_backoff: Duration,
 }
 
 impl Binance {
     pub fn new() -> Result<Self> {
+        Self::with_retries(DEFAULT_MAX_RETRIES)
+    }
+
+    /// Same as [`Binance::new`] with an explicit retry budget. `0` disables
+    /// retries, which is what tests want.
+    pub fn with_retries(max_retries: u32) -> Result<Self> {
         Ok(Self {
-            client: reqwest::ClientBuilder::new()
-                .timeout(Duration::from_secs(5))
-                .build()?,
+            client: reqwest::ClientBuilder::new().timeout(REQUEST_TIMEOUT).build()?,
+            max_retries,
+            base_backoff: DEFAULT_BACKOFF,
         })
+    }
+
+    /// Fetch one page, retrying transient failures with exponential backoff.
+    async fn fetch_page(&self, query: &[(&'static str, String)]) -> Result<serde_json::Value> {
+        let mut attempt = 0u32;
+        loop {
+            match self.try_fetch_page(query).await {
+                Ok(value) => return Ok(value),
+                Err(FetchError::Fatal(error)) => return Err(error),
+                Err(FetchError::Retryable { error, delay }) => {
+                    if attempt >= self.max_retries {
+                        return Err(error.context(format!(
+                            "binance klines: gave up after {} attempt(s)",
+                            attempt + 1
+                        )));
+                    }
+                    let wait = delay.unwrap_or_else(|| backoff_delay(self.base_backoff, attempt));
+                    eprintln!(
+                        "binance klines: {error:#} — retrying in {:.1}s ({}/{})",
+                        wait.as_secs_f64(),
+                        attempt + 1,
+                        self.max_retries
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn try_fetch_page(
+        &self,
+        query: &[(&'static str, String)],
+    ) -> std::result::Result<serde_json::Value, FetchError> {
+        let response = match self.client.get(BINANCE_KLINES_URL).query(query).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let transient = error.is_timeout() || error.is_connect();
+                let error = anyhow::Error::new(error).context("binance klines: request failed");
+                return Err(if transient {
+                    FetchError::Retryable { error, delay: None }
+                } else {
+                    FetchError::Fatal(error)
+                });
+            }
+        };
+
+        // Without this, a 429 or 5xx body is fed straight to the JSON parser
+        // and surfaces as a baffling "expected array, got {...}".
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = response.text().await.unwrap_or_default();
+            let error = anyhow!("binance klines: HTTP {status} — {}", truncate(&body, 300));
+            return Err(match classify_status(status, retry_after.as_deref()) {
+                Retry::No => FetchError::Fatal(error),
+                Retry::After(delay) => FetchError::Retryable { error, delay },
+            });
+        }
+
+        response.json().await.map_err(|error| FetchError::Retryable {
+            error: anyhow::Error::new(error).context("binance klines: malformed response body"),
+            delay: None,
+        })
+    }
+}
+
+enum FetchError {
+    Fatal(anyhow::Error),
+    Retryable {
+        error: anyhow::Error,
+        /// Server-requested delay, when it supplied one.
+        delay: Option<Duration>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    No,
+    After(Option<Duration>),
+}
+
+/// Retry policy for a non-success status. Rate limits (429) and IP bans (418)
+/// are retryable and carry a `Retry-After`; 5xx is retryable without one; every
+/// other 4xx (bad symbol, bad interval) is a client mistake that will fail
+/// identically forever.
+fn classify_status(status: StatusCode, retry_after: Option<&str>) -> Retry {
+    let too_many = status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 418;
+    if too_many {
+        let delay = retry_after
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .map(|delay| delay.min(MAX_RETRY_AFTER));
+        return Retry::After(delay);
+    }
+    if status.is_server_error() {
+        return Retry::After(None);
+    }
+    Retry::No
+}
+
+fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    base * 2u32.saturating_pow(attempt.min(6))
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_owned(),
     }
 }
 
@@ -183,14 +373,7 @@ impl KlineProvider for Binance {
             let interval = level.as_binance_str();
             let query = build_klines_query(&symbol, interval, time);
 
-            let response: serde_json::Value = self
-                .client
-                .get("https://api.binance.com/api/v3/klines")
-                .query(&query)
-                .send()
-                .await?
-                .json()
-                .await?;
+            let response = self.fetch_page(&query).await?;
 
             let array = response
                 .as_array()
@@ -261,13 +444,11 @@ where
     let range = range.into();
     let mut result = Vec::new();
 
-    let mut end = match range.end {
-        Some(end) => end,
-        None => SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock before unix epoch")?
-            .as_millis() as u64,
-    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_millis() as u64;
+    let mut end = range.end.unwrap_or(now_ms);
 
     loop {
         let v = provider.get_k(product, level, end).await?;
@@ -289,6 +470,18 @@ where
         } else {
             break;
         }
+    }
+
+    // Drop the still-forming candle(s) at the head of the window. Only the very
+    // newest can normally be unfinished, but filtering is cheap and it also
+    // covers a clock that has drifted behind the exchange's.
+    let before = result.len();
+    result.retain(|candle| candle_is_closed(level, candle.time, now_ms));
+    if result.len() != before {
+        eprintln!(
+            "Skipped {} still-forming {level} candle(s); they will be fetched once closed.",
+            before - result.len()
+        );
     }
 
     Ok(result)
@@ -417,6 +610,9 @@ mod tests {
     }
 
     impl KlineProvider for FakeProvider {
+        // The trait's `+ '_` ties the future to `&self` only, so the body may
+        // not borrow `product`; `async fn` would capture every input lifetime.
+        #[allow(clippy::manual_async_fn)]
         fn get_k(
             &self,
             _product: &str,
@@ -492,6 +688,130 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_k_range_drops_the_still_forming_candle() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let four_hours = 4 * 60 * 60 * 1000u64;
+        // Head of the page opens inside the current 4h bucket → still forming.
+        let forming = now - four_hours / 2;
+        let closed = now - 2 * four_hours;
+        let provider = FakeProvider::new(vec![vec![k(forming), k(closed)]]);
+
+        let result = get_k_range(&provider, "ANY", Level::Hour4, 0u64..)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.iter().any(|c| c.time == forming),
+            "the forming candle must not reach the cache"
+        );
+        assert!(
+            result.iter().any(|c| c.time == closed),
+            "closed candles must survive"
+        );
+    }
+
+    #[test]
+    fn fixed_duration_ms_matches_the_interval() {
+        assert_eq!(Level::Minute15.fixed_duration_ms(), Some(15 * 60_000));
+        assert_eq!(Level::Hour4.fixed_duration_ms(), Some(4 * 3_600_000));
+        assert_eq!(Level::Week1.fixed_duration_ms(), Some(7 * 86_400_000));
+        assert_eq!(Level::Month1.fixed_duration_ms(), None, "calendar month");
+        assert_eq!(Level::Month1.approx_duration_ms(), 30 * 86_400_000);
+    }
+
+    #[test]
+    fn candle_close_time_uses_calendar_months_for_monthly_bars() {
+        // 2024-01-01T00:00:00Z → 2024-02-01T00:00:00Z (31 days, not 30).
+        let jan = 1_704_067_200_000u64;
+        let feb = 1_706_745_600_000u64;
+        assert_eq!(candle_close_time_ms(Level::Month1, jan), Some(feb));
+        assert_eq!(feb - jan, 31 * 86_400_000, "January really is 31 days");
+    }
+
+    #[test]
+    fn candle_is_closed_compares_against_the_bar_end() {
+        let open = 1_704_067_200_000u64;
+        let hour = 3_600_000u64;
+        assert!(!candle_is_closed(Level::Hour1, open, open), "just opened");
+        assert!(
+            !candle_is_closed(Level::Hour1, open, open + hour - 1),
+            "one millisecond short of closing"
+        );
+        assert!(candle_is_closed(Level::Hour1, open, open + hour), "closed");
+    }
+
+    #[test]
+    fn candle_is_closed_treats_unrepresentable_timestamps_as_closed() {
+        // Keeping a suspect candle is recoverable; dropping real data is not.
+        assert!(candle_is_closed(Level::Month1, u64::MAX, 0));
+    }
+
+    #[test]
+    fn classify_status_retries_rate_limits_with_the_server_delay() {
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, Some("3")),
+            Retry::After(Some(Duration::from_secs(3)))
+        );
+        assert_eq!(
+            classify_status(StatusCode::from_u16(418).unwrap(), Some("120")),
+            Retry::After(Some(Duration::from_secs(120))),
+            "418 is Binance's IP ban"
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, None),
+            Retry::After(None),
+            "no header → fall back to backoff"
+        );
+    }
+
+    #[test]
+    fn classify_status_caps_a_hostile_retry_after() {
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, Some("999999")),
+            Retry::After(Some(MAX_RETRY_AFTER))
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, Some("nonsense")),
+            Retry::After(None),
+            "unparseable header → backoff, not a panic"
+        );
+    }
+
+    #[test]
+    fn classify_status_retries_server_errors_but_not_client_errors() {
+        assert_eq!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, None),
+            Retry::After(None)
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_REQUEST, None),
+            Retry::No,
+            "an invalid symbol will fail identically forever"
+        );
+        assert_eq!(classify_status(StatusCode::NOT_FOUND, None), Retry::No);
+    }
+
+    #[test]
+    fn backoff_delay_doubles_and_saturates() {
+        let base = Duration::from_millis(500);
+        assert_eq!(backoff_delay(base, 0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(base, 1), Duration::from_secs(1));
+        assert_eq!(backoff_delay(base, 3), Duration::from_secs(4));
+        // The `min(6)` clamp keeps the multiplier from overflowing.
+        assert_eq!(backoff_delay(base, 99), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn truncate_marks_shortened_bodies_and_respects_char_boundaries() {
+        assert_eq!(truncate("short", 100), "short");
+        assert_eq!(truncate("abcdef", 3), "abc…");
+        assert_eq!(truncate("héllo", 2), "hé…", "must not split a code point");
     }
 
     #[tokio::test]
