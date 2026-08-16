@@ -502,8 +502,8 @@ pub fn run<S: Strategy>(
 mod tests {
     use super::*;
     use crate::data::OwnedBars;
+    use crate::indicators::PeriodCache;
     use crate::strategy::double_ema::DoubleEmaCrossover;
-    use crate::ta_wrapper::EMAStore;
 
     /// Bars with independent open and close columns — the execution model
     /// fills at the *next* open and marks at that bar's close, so the two must
@@ -565,7 +565,7 @@ mod tests {
         let close_prices = vec![100.0_f32, 100.0, 100.0];
         let ema_fast = vec![f32::NAN, 2.0, 2.0];
         let ema_slow = vec![f32::NAN, 1.0, 1.0];
-        let cache = EMAStore::<f32>::from_series(1, vec![ema_fast, ema_slow]);
+        let cache = PeriodCache::<f32>::from_series(1, vec![ema_fast, ema_slow]);
         let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f32>(
@@ -584,7 +584,7 @@ mod tests {
         let close_prices = vec![100.0_f32; 6];
         let ema_fast = vec![f32::NAN, 2.0, 2.0, 2.0, 1.0, 1.0];
         let ema_slow = vec![f32::NAN, 1.0, 1.0, 1.0, 2.0, 2.0];
-        let cache = EMAStore::<f32>::from_series(1, vec![ema_fast, ema_slow]);
+        let cache = PeriodCache::<f32>::from_series(1, vec![ema_fast, ema_slow]);
         let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f32>(
@@ -609,7 +609,7 @@ mod tests {
         let close_prices = vec![100.0_f64, 100.0, 100.0];
         let ema_fast = vec![f64::NAN, 2.0, 2.0];
         let ema_slow = vec![f64::NAN, 1.0, 1.0];
-        let cache = EMAStore::<f64>::from_series(1, vec![ema_fast, ema_slow]);
+        let cache = PeriodCache::<f64>::from_series(1, vec![ema_fast, ema_slow]);
         let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f64>(

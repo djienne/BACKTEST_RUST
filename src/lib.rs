@@ -1,10 +1,10 @@
-pub mod backtest;
+﻿pub mod backtest;
 pub mod data;
 pub mod download;
 pub mod exchange;
 pub mod feather;
+pub mod indicators;
 pub mod metrics;
 pub mod output;
 pub mod precision;
 pub mod strategy;
-pub mod ta_wrapper;

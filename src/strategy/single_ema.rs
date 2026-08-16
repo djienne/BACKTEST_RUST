@@ -1,13 +1,14 @@
-//! Price-vs-EMA threshold: long when close > EMA, flat otherwise.
+﻿//! Price-vs-EMA threshold: long when close > EMA, flat otherwise.
 //!
 //! This is a seam-validating stub — not wired into the CLI. Its purpose is
 //! to prove the `Strategy` trait works for a strategy with a 1-parameter
 //! sweep that combines a precomputed indicator with a raw price column.
 
 use crate::data::Bars;
+use crate::indicators::ma::ema;
+use crate::indicators::{BarsF64, PeriodCache};
 use crate::precision::BacktestFloat;
 use crate::strategy::{Signal, Strategy};
-use crate::ta_wrapper::EMAStore;
 use std::cmp::Ordering;
 
 pub struct PriceVsEma;
@@ -20,12 +21,15 @@ pub struct PriceVsEmaConfig {
 
 impl Strategy for PriceVsEma {
     type Params = usize;
-    type Cache<T: BacktestFloat> = EMAStore<T>;
+    type Cache<T: BacktestFloat> = PeriodCache<T>;
     type Config = PriceVsEmaConfig;
     const NAME: &'static str = "price_vs_ema";
 
     fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
-        EMAStore::new(bars.close, cfg.period_min, cfg.period_max)
+        let source = BarsF64::from_bars(bars);
+        PeriodCache::build(&source, cfg.period_min, cfg.period_max, |bars, period| {
+            ema(&bars.close, period)
+        })
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -38,8 +42,8 @@ impl Strategy for PriceVsEma {
         params: Self::Params,
     ) -> impl Fn(usize) -> Signal + 'a {
         let ema = cache
-            .get_ema(params)
-            .unwrap_or_else(|| panic!("EMA store missing period {params}"));
+            .get(params)
+            .unwrap_or_else(|| panic!("EMA cache missing period {params}"));
         let close = bars.close;
         move |bar_index| {
             let close_value = close[bar_index];
@@ -71,7 +75,7 @@ mod tests {
     #[test]
     fn evaluator_enters_long_when_close_above_ema() {
         let prices = OwnedBars::from_close(vec![100.0_f32, 110.0, 120.0]);
-        let cache = EMAStore::<f32>::from_series(1, vec![vec![100.0, 105.0, 115.0]]);
+        let cache = PeriodCache::<f32>::from_series(1, vec![vec![100.0, 105.0, 115.0]]);
         let evaluator = PriceVsEma::evaluator::<f32>(prices.bars(), &cache, 1);
         assert_eq!(evaluator(0), Signal::Hold); // 100 == 100
         assert_eq!(evaluator(1), Signal::EnterLong); // 110 > 105
@@ -81,7 +85,7 @@ mod tests {
     #[test]
     fn evaluator_exits_when_close_falls_below_ema() {
         let prices = OwnedBars::from_close(vec![110.0_f32, 100.0]);
-        let cache = EMAStore::<f32>::from_series(1, vec![vec![105.0, 105.0]]);
+        let cache = PeriodCache::<f32>::from_series(1, vec![vec![105.0, 105.0]]);
         let evaluator = PriceVsEma::evaluator::<f32>(prices.bars(), &cache, 1);
         assert_eq!(evaluator(0), Signal::EnterLong);
         assert_eq!(evaluator(1), Signal::ExitLong);

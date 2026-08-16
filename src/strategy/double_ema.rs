@@ -1,14 +1,15 @@
 //! Two-EMA crossover strategy: long when fast EMA > slow EMA, flat otherwise.
 //!
 //! Indicator values become valid one bar after each EMA's period; before
-//! that, the EMA is `NaN` and `NaN > NaN` is `false`, so `desired_position`
-//! naturally returns `Flat` during warmup without an explicit guard.
+//! that, the EMA is `NaN` and every comparison against `NaN` is false, so the
+//! evaluator naturally emits `Hold` during warmup without an explicit guard.
 
 use crate::backtest::ema_parameter_pairs;
 use crate::data::Bars;
+use crate::indicators::ma::ema;
+use crate::indicators::{BarsF64, PeriodCache};
 use crate::precision::BacktestFloat;
 use crate::strategy::{Signal, Strategy};
-use crate::ta_wrapper::EMAStore;
 use std::cmp::Ordering;
 
 pub struct DoubleEmaCrossover;
@@ -22,12 +23,18 @@ pub struct DoubleEmaConfig {
 
 impl Strategy for DoubleEmaCrossover {
     type Params = (usize, usize);
-    type Cache<T: BacktestFloat> = EMAStore<T>;
+    type Cache<T: BacktestFloat> = PeriodCache<T>;
     type Config = DoubleEmaConfig;
     const NAME: &'static str = "double_ema";
 
     fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
-        EMAStore::new(bars.close, cfg.fast_period_min, cfg.max_period)
+        let source = BarsF64::from_bars(bars);
+        PeriodCache::build(
+            &source,
+            cfg.fast_period_min,
+            cfg.max_period,
+            |bars, period| ema(&bars.close, period),
+        )
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -41,11 +48,11 @@ impl Strategy for DoubleEmaCrossover {
     ) -> impl Fn(usize) -> Signal + 'a {
         let (fast_period, slow_period) = params;
         let fast = cache
-            .get_ema(fast_period)
-            .unwrap_or_else(|| panic!("EMA store missing fast period {fast_period}"));
+            .get(fast_period)
+            .unwrap_or_else(|| panic!("EMA cache missing fast period {fast_period}"));
         let slow = cache
-            .get_ema(slow_period)
-            .unwrap_or_else(|| panic!("EMA store missing slow period {slow_period}"));
+            .get(slow_period)
+            .unwrap_or_else(|| panic!("EMA cache missing slow period {slow_period}"));
         move |bar_index| {
             let fast_value = fast[bar_index];
             let slow_value = slow[bar_index];
@@ -54,7 +61,7 @@ impl Strategy for DoubleEmaCrossover {
             } else if fast_value < slow_value {
                 Signal::ExitLong
             } else {
-                // Equal or NaN — preserves the pre-refactor "no transition" path.
+                // Equal or NaN — no transition.
                 Signal::Hold
             }
         }
@@ -64,8 +71,8 @@ impl Strategy for DoubleEmaCrossover {
         format!("fast={fast},slow={slow}")
     }
 
-    /// Smaller `(fast, slow)` lex-tuple wins on ties — preserves the
-    /// pre-refactor behavior so determinism checks against `main` hold.
+    /// Smaller `(fast, slow)` lex-tuple wins on ties, so a sweep is
+    /// reproducible regardless of how rayon happened to schedule it.
     fn tie_break(left: Self::Params, right: Self::Params) -> Ordering {
         left.cmp(&right)
     }
@@ -74,6 +81,7 @@ impl Strategy for DoubleEmaCrossover {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::OwnedBars;
 
     #[test]
     fn enumerate_params_matches_search_space() {
@@ -90,8 +98,8 @@ mod tests {
 
     #[test]
     fn evaluator_emits_enter_long_when_fast_crosses_above_slow() {
-        let prices = crate::data::OwnedBars::from_close(vec![1.0_f32; 4]);
-        let cache = EMAStore::<f32>::from_series(
+        let prices = OwnedBars::from_close(vec![1.0_f32; 4]);
+        let cache = PeriodCache::<f32>::from_series(
             1,
             vec![vec![f32::NAN, 2.0, 1.0, 1.0], vec![f32::NAN, 1.0, 2.0, 1.0]],
         );
@@ -104,5 +112,20 @@ mod tests {
         assert_eq!(evaluator(2), Signal::ExitLong);
         // Index 3: fast=1 == slow=1 → Hold.
         assert_eq!(evaluator(3), Signal::Hold);
+    }
+
+    #[test]
+    fn build_cache_covers_every_period_the_sweep_will_ask_for() {
+        let prices = OwnedBars::from_close((0..100).map(|i| 100.0 + i as f32).collect());
+        let cfg = DoubleEmaConfig {
+            fast_period_min: 5,
+            slow_period_min: 6,
+            max_period: 12,
+        };
+        let cache = DoubleEmaCrossover::build_cache::<f32>(prices.bars(), &cfg);
+        for (fast, slow) in DoubleEmaCrossover::enumerate_params(&cfg) {
+            assert!(cache.get(fast).is_some(), "missing fast period {fast}");
+            assert!(cache.get(slow).is_some(), "missing slow period {slow}");
+        }
     }
 }

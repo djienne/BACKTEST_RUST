@@ -61,6 +61,7 @@ pub trait BacktestFloat:
     const NAN: Self;
 
     fn from_f32(value: f32) -> Self;
+    fn from_f64(value: f64) -> Self;
     fn from_usize(value: usize) -> Self;
     fn to_f64(self) -> f64;
     fn sqrt(self) -> Self;
@@ -74,6 +75,10 @@ impl BacktestFloat for f32 {
 
     fn from_f32(value: f32) -> Self {
         value
+    }
+
+    fn from_f64(value: f64) -> Self {
+        value as f32
     }
 
     fn from_usize(value: usize) -> Self {
@@ -100,6 +105,10 @@ impl BacktestFloat for f64 {
 
     fn from_f32(value: f32) -> Self {
         value as f64
+    }
+
+    fn from_f64(value: f64) -> Self {
+        value
     }
 
     fn from_usize(value: usize) -> Self {
