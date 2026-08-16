@@ -35,6 +35,7 @@ fn engine() -> EngineConfig {
         show_progress: false,
         progress_step: 100_000,
         download_start: 0,
+        split: None,
     }
 }
 

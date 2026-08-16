@@ -33,6 +33,7 @@ fn default_engine_config() -> EngineConfig {
         show_progress: true,
         progress_step: 10_000,
         download_start: default_download_start(),
+        split: None,
     }
 }
 
@@ -75,6 +76,7 @@ struct CliOpts {
     threads: Option<usize>,
     data_dir: Option<String>,
     results_dir: Option<String>,
+    split: Option<f32>,
 }
 
 impl CliOpts {
@@ -142,6 +144,7 @@ where
     let mut threads: Option<usize> = None;
     let mut data_dir: Option<String> = None;
     let mut results_dir: Option<String> = None;
+    let mut split: Option<f32> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -184,6 +187,12 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--results-dir requires a path"))?;
                 results_dir = Some(value.as_ref().to_string());
             }
+            "--split" => {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("--split requires a fraction between 0 and 1 (e.g. 0.7)")
+                })?;
+                split = Some(parse_split_value(value.as_ref())?);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -201,7 +210,19 @@ where
         threads,
         data_dir,
         results_dir,
+        split,
     })
+}
+
+fn parse_split_value(value: &str) -> anyhow::Result<f32> {
+    let fraction: f32 = value
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid --split '{value}'; expected a fraction like 0.7"))?;
+    if !(0.0..=1.0).contains(&fraction) {
+        anyhow::bail!("invalid --split '{value}'; must be between 0 and 1");
+    }
+    Ok(fraction)
 }
 
 fn print_usage() {
@@ -215,6 +236,8 @@ fn print_usage() {
            --threads <N>         Rayon worker threads; 0 = auto (default: 1)\n  \
            --force               Bypass the freshness guard and re-download\n  \
            --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)\n  \
+           --split <FRACTION>    Optimize on the leading FRACTION of candles and\n                         \
+                                 report the winner on the held-out remainder\n  \
            --data-dir <PATH>     Kline cache directory (default: dataKLines)\n  \
            --results-dir <PATH>  Results CSV directory (default: results)\n  \
            -h, --help            Show this message\n\n\
@@ -230,6 +253,22 @@ fn load_engine_config() -> anyhow::Result<EngineConfig> {
         config.show_progress = value;
     }
     Ok(config)
+}
+
+fn print_metrics(label: &str, m: &backtest_rust::backtest::BacktestMetrics) {
+    println!(
+        "{label}: value {:.3}$ | sharpe {:.6} | sortino {:.6} | calmar {:.3} | \
+         cagr {:.2}% | max_dd {:.2}% | trades {} | win {:.1}% | exposure {:.1}%",
+        m.final_value,
+        m.sharpe_ratio,
+        m.sortino_ratio,
+        m.calmar_ratio,
+        m.cagr,
+        m.max_drawdown,
+        m.trades,
+        m.win_rate,
+        m.exposure,
+    );
 }
 
 fn print_boundary_timestamp(label: &str, ts: Option<u64>) {
@@ -267,6 +306,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(threads) = cli.threads {
         engine.threads = threads;
+    }
+    if let Some(split) = cli.split {
+        engine.split = Some(split);
     }
 
     let env_force = read_env_bool("BACKTEST_FORCE_DOWNLOAD")?.unwrap_or(false);
@@ -322,14 +364,22 @@ async fn main() -> anyhow::Result<()> {
     println!("Done");
     println!("Strategy: {}", DoubleEmaCrossover::NAME);
     println!("Precision: {}", selected.precision);
-    println!(
-        "Best result: sharpe: {:.6}, max_dd: {:.4}, params: {}",
-        selected.best.metrics.sharpe_ratio, selected.best.metrics.max_drawdown, params_summary,
+    println!("Best params: {params_summary}");
+    print_metrics(
+        if selected.out_of_sample.is_some() {
+            "In-sample"
+        } else {
+            "Result"
+        },
+        &selected.best.metrics,
     );
-    println!(
-        "Final portfolio value: {:.3}$",
-        selected.best.metrics.final_value
-    );
+    if let Some(out_of_sample) = &selected.out_of_sample {
+        print_metrics("Out-of-sample", out_of_sample);
+        println!(
+            "  (the out-of-sample row is the honest one; the in-sample row is \
+             fitted to its own data)"
+        );
+    }
     println!("Sweep duration: {:.3}s", selected.duration.as_secs_f64());
 
     let ohlcv_file = format!("{}-{}", engine.pair, engine.level);
@@ -342,9 +392,8 @@ async fn main() -> anyhow::Result<()> {
             strategy: DoubleEmaCrossover::NAME,
             params: &params_summary,
             duration_ms: selected.duration.as_secs_f64() * 1000.0,
-            port_value: selected.best.metrics.final_value,
-            max_dd: selected.best.metrics.max_drawdown,
-            sharpe_ratio: selected.best.metrics.sharpe_ratio,
+            metrics: selected.best.metrics,
+            out_of_sample: selected.out_of_sample,
         },
     )?;
 

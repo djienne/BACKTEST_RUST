@@ -194,12 +194,12 @@ impl DataPaths {
 
     /// Appended run history for `(pair, level)`.
     ///
-    /// The `_v2` suffix isolates the Strategy/Params CSV schema from older
-    /// Period1/Period2 files — `write_to_file` only emits a header for an
-    /// empty or missing target, so appending to an old file would silently
-    /// interleave two schemas.
+    /// The version suffix isolates each CSV schema from the last —
+    /// `write_to_file` only emits a header for an empty or missing target, so
+    /// appending to an older file would silently interleave two layouts. Bump
+    /// it whenever the column set changes.
     pub fn results(&self, pair: &str, level: &Level) -> PathBuf {
-        self.results_dir.join(format!("{pair}-{level}_v2.csv"))
+        self.results_dir.join(format!("{pair}-{level}_v3.csv"))
     }
 }
 
@@ -296,7 +296,7 @@ mod tests {
         );
         assert_eq!(
             paths.results("BTC-USDT", &Level::Hour4),
-            Path::new("some/results").join("BTC-USDT-4h_v2.csv")
+            Path::new("some/results").join("BTC-USDT-4h_v3.csv")
         );
     }
 }

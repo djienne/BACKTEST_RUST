@@ -1,6 +1,6 @@
 use crate::data::{Bars, CandleSeries, MarketArrays};
 use crate::exchange::Level;
-use crate::metrics::{max_drawdown, sharpe_ratio};
+use crate::metrics::{calmar_ratio, EquityStats};
 use crate::precision::{BacktestFloat, Float, Precision, ACTIVE_PRECISION};
 use crate::strategy::{Position, Signal, Strategy};
 use anyhow::Context;
@@ -43,13 +43,87 @@ pub struct EngineConfig {
     pub show_progress: bool,
     pub progress_step: usize,
     pub download_start: u64,
+    /// Fraction of the series to optimize on, leaving the rest held out.
+    /// `None` sweeps the whole series — the winner is then an in-sample
+    /// result by construction, which is what this option exists to expose.
+    pub split: Option<f32>,
 }
 
+/// How the bar index space is divided between optimization and validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SampleSplit {
+    pub in_sample: std::ops::Range<usize>,
+    /// `None` when the whole series is optimized on.
+    pub out_of_sample: Option<std::ops::Range<usize>>,
+}
+
+/// Split `bars` bars at `fraction`. Returns the whole range unsplit when the
+/// fraction is absent, out of range, or would leave either side too short to
+/// backtest (a segment needs at least two bars to produce one return).
+pub fn sample_split(bars: usize, fraction: Option<f32>) -> SampleSplit {
+    const MIN_SEGMENT: usize = 2;
+    let whole = SampleSplit {
+        in_sample: 0..bars,
+        out_of_sample: None,
+    };
+    let Some(fraction) = fraction else {
+        return whole;
+    };
+    if !(0.0..=1.0).contains(&fraction) {
+        return whole;
+    }
+    let boundary = (bars as f32 * fraction) as usize;
+    if boundary < MIN_SEGMENT || bars.saturating_sub(boundary) < MIN_SEGMENT {
+        return whole;
+    }
+    SampleSplit {
+        in_sample: 0..boundary,
+        out_of_sample: Some(boundary..bars),
+    }
+}
+
+/// Everything one backtest reports. Only `sharpe_ratio` and `final_value` take
+/// part in ranking (see `prefer`); the rest are for the operator reading the
+/// result, and exist because "best Sharpe" alone hides whether a strategy
+/// traded twice or twenty thousand times.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BacktestMetrics {
     pub final_value: f64,
+    /// Deepest peak-to-trough decline, as a percentage.
     pub max_drawdown: f64,
     pub sharpe_ratio: f64,
+    /// Downside-only counterpart to Sharpe. May be infinite — see
+    /// `metrics::EquityStats::sortino`.
+    pub sortino_ratio: f64,
+    /// CAGR divided by max drawdown.
+    pub calmar_ratio: f64,
+    /// Compound annual growth rate, as a percentage.
+    pub cagr: f64,
+    /// Completed round trips. A position still open at the last bar is not
+    /// counted, here or in `win_rate`.
+    pub trades: usize,
+    /// Share of completed round trips that made money, as a percentage.
+    pub win_rate: f64,
+    /// Share of bars spent holding the asset, as a percentage. A strategy with
+    /// a great Sharpe and 2% exposure is a different animal from one at 90%.
+    pub exposure: f64,
+}
+
+impl BacktestMetrics {
+    /// The result of doing nothing: no trades, no drawdown, capital intact.
+    pub fn idle(starting_capital: f64) -> Self {
+        Self {
+            final_value: starting_capital,
+            max_drawdown: 0.0,
+            sharpe_ratio: 0.0,
+            sortino_ratio: 0.0,
+            calmar_ratio: 0.0,
+            cagr: 0.0,
+            trades: 0,
+            win_rate: 0.0,
+            exposure: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,7 +144,12 @@ pub struct SweepResult<P> {
 #[derive(Clone, Copy, Debug)]
 pub struct PrecisionRun<P> {
     pub precision: Precision,
+    /// Winner of the sweep, scored over the optimization segment.
     pub best: SweepResult<P>,
+    /// The same parameters re-scored on the held-out tail, when a split was
+    /// requested. This is the number worth trusting; `best` is fitted to its
+    /// own data by construction.
+    pub out_of_sample: Option<BacktestMetrics>,
     pub duration: Duration,
 }
 
@@ -159,42 +238,61 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
     params: S::Params,
     cfg: NumericBacktestConfig<T>,
 ) -> BacktestMetrics {
+    run_one_range::<S, T>(bars, cache, params, cfg, 0..bars.len())
+}
+
+/// [`run_one`] restricted to a slice of the bar index space.
+///
+/// The indicator cache is always built over the *whole* series, so an
+/// out-of-sample segment starting at bar `k` sees indicators with their full
+/// warmup behind them rather than a fresh, invalid one. That is why the range
+/// is a parameter here instead of the caller simply passing shorter slices.
+pub fn run_one_range<S: Strategy, T: BacktestFloat>(
+    bars: Bars<'_, T>,
+    cache: &S::Cache<T>,
+    params: S::Params,
+    cfg: NumericBacktestConfig<T>,
+    range: std::ops::Range<usize>,
+) -> BacktestMetrics {
     let (open, close) = (bars.open, bars.close);
     // `run` rejects mismatched inputs up front; the assert keeps that contract
-    // visible here, and the `min` keeps a release build safely truncating
+    // visible here, and the clamp keeps a release build safely truncating
     // rather than indexing past an end.
     debug_assert_eq!(open.len(), close.len(), "open/close length mismatch");
-    let n = open.len().min(close.len());
-    if n == 0 {
-        return BacktestMetrics {
-            final_value: cfg.starting_capital.to_f64(),
-            max_drawdown: 0.0,
-            sharpe_ratio: 0.0,
-        };
+    let limit = open.len().min(close.len());
+    let start = range.start.min(limit);
+    let end = range.end.min(limit);
+    let starting_capital = cfg.starting_capital.to_f64();
+    if end.saturating_sub(start) < 2 {
+        return BacktestMetrics::idle(starting_capital);
     }
+
     let evaluator = S::evaluator::<T>(bars, cache, params);
+    let risk_free = cfg.risk_free_rate.to_f64();
 
     let mut usdt: T = cfg.starting_capital;
     let mut qty: T = T::ZERO;
     let mut current = Position::Flat;
-    let mut prev_value: T = usdt;
+    let mut stats = EquityStats::new(starting_capital);
 
-    let mut portfolio_values = Vec::with_capacity(n);
-    portfolio_values.push(usdt);
-    let mut returns = Vec::with_capacity(n - 1);
+    let mut trades = 0usize;
+    let mut wins = 0usize;
+    let mut bars_in_market = 0usize;
+    let mut entry_value = starting_capital;
 
     // Pre-slice the trade and mark price views so the per-bar access goes
     // through bounds-check-free iterators. The strategy's `evaluator` reads
-    // `bar_index` (the lookback) directly from its hoisted slices.
-    let trades = match cfg.execution_model {
-        ExecutionModel::NextOpen => &open[1..n],
+    // absolute bar indices, hence `start + offset` below.
+    let trade_prices = match cfg.execution_model {
+        ExecutionModel::NextOpen => &open[start + 1..end],
     };
-    let marks = &close[1..n];
+    let marks = &close[start + 1..end];
 
-    for (bar_index, (&trade_price, &mark_price)) in trades.iter().zip(marks.iter()).enumerate() {
-        let signal = evaluator(bar_index);
+    for (offset, (&trade_price, &mark_price)) in trade_prices.iter().zip(marks.iter()).enumerate() {
+        let signal = evaluator(start + offset);
         match (current, signal) {
             (Position::Flat, Signal::EnterLong) => {
+                entry_value = usdt.to_f64();
                 qty = usdt / trade_price * (T::ONE - cfg.fee_rate);
                 usdt = T::ZERO;
                 current = Position::Long;
@@ -203,35 +301,50 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
                 usdt = qty * trade_price * (T::ONE - cfg.fee_rate);
                 qty = T::ZERO;
                 current = Position::Flat;
+                trades += 1;
+                if usdt.to_f64() > entry_value {
+                    wins += 1;
+                }
             }
             _ => {}
         }
 
         let value = match current {
-            Position::Long => qty * mark_price,
+            Position::Long => {
+                bars_in_market += 1;
+                qty * mark_price
+            }
             Position::Flat => usdt,
         };
-        portfolio_values.push(value);
-        if prev_value > T::ZERO {
-            returns.push((value - prev_value) / prev_value);
-        }
-        prev_value = value;
+        stats.push(value.to_f64(), risk_free);
     }
 
-    let final_value = portfolio_values.last().copied().unwrap().to_f64();
-    let max_drawdown = max_drawdown(&portfolio_values);
-    let sharpe = sharpe_ratio(&returns, cfg.risk_free_rate, cfg.periods_per_year);
-
+    let simulated_bars = marks.len();
+    let cagr = stats.cagr_pct(starting_capital, simulated_bars, cfg.periods_per_year);
+    let max_drawdown = stats.max_drawdown_pct();
     let metrics = BacktestMetrics {
-        final_value,
+        final_value: stats.final_value(),
         max_drawdown,
-        sharpe_ratio: sharpe,
+        sharpe_ratio: stats.sharpe(risk_free, cfg.periods_per_year),
+        sortino_ratio: stats.sortino(risk_free, cfg.periods_per_year),
+        calmar_ratio: calmar_ratio(cagr, max_drawdown),
+        cagr,
+        trades,
+        win_rate: percentage(wins, trades),
+        exposure: percentage(bars_in_market, simulated_bars),
     };
     debug_assert!(
         metrics.sharpe_ratio.is_finite(),
         "non-finite sharpe leaked from backtest"
     );
     metrics
+}
+
+fn percentage(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 / whole as f64 * 100.0
 }
 
 fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
@@ -241,17 +354,34 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
     bars: Bars<'_, T>,
     parameter_set: &[S::Params],
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
-    println!("Calculating all indicators for {}...", ACTIVE_PRECISION);
+    report(
+        engine,
+        format_args!("Calculating all indicators for {ACTIVE_PRECISION}..."),
+    );
     let cache = S::build_cache::<T>(bars, strategy_config);
     let backtest_config = numeric_backtest_config::<T>(engine);
+    let split = sample_split(bars.len(), engine.split);
 
-    println!("Calculated all indicators for {}.", ACTIVE_PRECISION);
-    if engine.show_progress {
-        println!(
-            "Running all backtests on {} threads with {}...",
-            engine.threads, ACTIVE_PRECISION
+    report(
+        engine,
+        format_args!("Calculated all indicators for {ACTIVE_PRECISION}."),
+    );
+    if let Some(out) = &split.out_of_sample {
+        report(
+            engine,
+            format_args!(
+                "Optimizing on bars 0..{} and holding out {}..{} for validation.",
+                split.in_sample.end, out.start, out.end
+            ),
         );
     }
+    report(
+        engine,
+        format_args!(
+            "Running all backtests on {} threads with {ACTIVE_PRECISION}...",
+            engine.threads
+        ),
+    );
 
     let total_iterations = parameter_set.len();
     let progress_counter = AtomicUsize::new(0);
@@ -263,7 +393,13 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                 .fold(
                     || None::<SweepResult<S::Params>>,
                     |acc, &params| {
-                        let metrics = run_one::<S, T>(bars, &cache, params, backtest_config);
+                        let metrics = run_one_range::<S, T>(
+                            bars,
+                            &cache,
+                            params,
+                            backtest_config,
+                            split.in_sample.clone(),
+                        );
 
                         let count = progress_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                         if engine.show_progress
@@ -294,12 +430,28 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                 )
         })
         .with_context(|| format!("strategy '{}' produced an empty parameter sweep", S::NAME))?;
+    let duration = start.elapsed();
+
+    // Re-score the winner on the held-out tail. One extra backtest, after the
+    // sweep, so it stays out of the measured duration.
+    let out_of_sample = split
+        .out_of_sample
+        .map(|range| run_one_range::<S, T>(bars, &cache, best.params, backtest_config, range));
 
     Ok(PrecisionRun {
         precision: ACTIVE_PRECISION,
         best,
-        duration: start.elapsed(),
+        out_of_sample,
+        duration,
     })
+}
+
+/// Engine-side progress reporting, gated on `show_progress` in one place
+/// rather than at each `println!`.
+fn report(engine: &EngineConfig, message: std::fmt::Arguments<'_>) {
+    if engine.show_progress {
+        println!("{message}");
+    }
 }
 
 pub fn run<S: Strategy>(
@@ -358,6 +510,43 @@ mod tests {
     /// be distinguishable for these tests to mean anything.
     fn bars_of<T: BacktestFloat>(open: Vec<T>, close: Vec<T>) -> OwnedBars<T> {
         OwnedBars::ohlc(open, close.clone(), close.clone(), close)
+    }
+
+    /// A strategy that replays a canned signal per bar. Lets engine tests pin
+    /// position transitions, trade counting and segment ranges without an
+    /// indicator in the way.
+    struct SignalScript;
+
+    impl Strategy for SignalScript {
+        type Params = ();
+        type Cache<T: BacktestFloat> = Vec<Signal>;
+        type Config = Vec<Signal>;
+        const NAME: &'static str = "signal_script";
+
+        fn build_cache<T: BacktestFloat>(_: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
+            cfg.clone()
+        }
+
+        fn enumerate_params(_: &Self::Config) -> Vec<Self::Params> {
+            vec![()]
+        }
+
+        fn evaluator<'a, T: BacktestFloat>(
+            _: Bars<'a, T>,
+            cache: &'a Self::Cache<T>,
+            _: (),
+        ) -> impl Fn(usize) -> Signal + 'a {
+            // Bars past the end of the script simply hold.
+            move |i| cache.get(i).copied().unwrap_or(Signal::Hold)
+        }
+
+        fn param_summary(_: ()) -> String {
+            String::new()
+        }
+
+        fn tie_break(_: (), _: ()) -> Ordering {
+            Ordering::Equal
+        }
     }
 
     fn num_cfg<T: BacktestFloat>(starting: f32) -> NumericBacktestConfig<T> {
@@ -433,41 +622,10 @@ mod tests {
         assert!((metrics.final_value - 499.25).abs() < 1e-6);
     }
 
-    /// Engine-level test using a `TestStrategy` with a fixed signal sequence.
+    /// Engine-level test using `SignalScript` with a fixed signal sequence.
     /// Exercises the position-transition match independently of any indicator.
     #[test]
     fn run_one_engine_transitions_match_test_strategy_signals() {
-        struct TestStrategy;
-        impl Strategy for TestStrategy {
-            type Params = ();
-            type Cache<T: BacktestFloat> = Vec<Signal>;
-            type Config = Vec<Signal>;
-            const NAME: &'static str = "test";
-
-            fn build_cache<T: BacktestFloat>(_: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
-                cfg.clone()
-            }
-
-            fn enumerate_params(_: &Self::Config) -> Vec<Self::Params> {
-                vec![()]
-            }
-
-            fn evaluator<'a, T: BacktestFloat>(
-                _: Bars<'a, T>,
-                cache: &'a Self::Cache<T>,
-                _: (),
-            ) -> impl Fn(usize) -> Signal + 'a {
-                move |i| cache[i]
-            }
-
-            fn param_summary(_: ()) -> String {
-                String::new()
-            }
-            fn tie_break(_: (), _: ()) -> Ordering {
-                Ordering::Equal
-            }
-        }
-
         // 4 bars; engine reads signals at bar_index = 0..=2 (n - 1 = 3 iters).
         // i=0: Hold → no transition. value = usdt = 1000.
         // i=1: EnterLong → enter at open[2]=200. qty = 1000/200*0.9985 = 4.9925.
@@ -479,7 +637,7 @@ mod tests {
         let prices = bars_of(open_prices, close_prices);
 
         let metrics =
-            run_one::<TestStrategy, f32>(prices.bars(), &cache, (), num_cfg::<f32>(1000.0));
+            run_one::<SignalScript, f32>(prices.bars(), &cache, (), num_cfg::<f32>(1000.0));
 
         assert!(
             (metrics.final_value - 499.25).abs() < 1e-3,
@@ -504,8 +662,8 @@ mod tests {
         SweepResult {
             metrics: BacktestMetrics {
                 final_value,
-                max_drawdown: 0.0,
                 sharpe_ratio: sharpe,
+                ..BacktestMetrics::idle(final_value)
             },
             params,
         }
@@ -524,6 +682,122 @@ mod tests {
         let lo = sweep::<(usize, usize)>((10, 20), 0.5, 1000.0);
         let hi = sweep::<(usize, usize)>((12, 24), 1.0, 900.0);
         assert_eq!(prefer::<DoubleEmaCrossover>(lo, hi), hi);
+    }
+
+    #[test]
+    fn sample_split_divides_the_bar_range() {
+        let split = sample_split(100, Some(0.7));
+        assert_eq!(split.in_sample, 0..70);
+        assert_eq!(split.out_of_sample, Some(70..100));
+    }
+
+    #[test]
+    fn sample_split_falls_back_to_the_whole_range_when_a_side_would_be_too_short() {
+        for (bars, fraction) in [
+            (100, None),
+            (100, Some(0.0)),
+            (100, Some(1.0)),
+            (100, Some(1.5)),  // out of range
+            (100, Some(-0.5)), // out of range
+            (100, Some(0.01)), // in-sample would be 1 bar
+            (100, Some(0.99)), // out-of-sample would be 1 bar
+            (3, Some(0.5)),    // too few bars to divide at all
+        ] {
+            let split = sample_split(bars, fraction);
+            assert_eq!(
+                split.in_sample,
+                0..bars,
+                "bars={bars} fraction={fraction:?}"
+            );
+            assert_eq!(
+                split.out_of_sample, None,
+                "bars={bars} fraction={fraction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_one_range_scores_only_the_requested_segment() {
+        // Flat for the first half, then a steady climb. A strategy that is
+        // always long must show no gain in the first segment and a gain in
+        // the second.
+        let mut close = vec![100.0_f32; 10];
+        close.extend((1..=10).map(|i| 100.0 + 10.0 * i as f32));
+        let prices = bars_of(close.clone(), close.clone());
+        let always_long: Vec<Signal> = vec![Signal::EnterLong; close.len()];
+
+        let first = run_one_range::<SignalScript, f32>(
+            prices.bars(),
+            &always_long,
+            (),
+            num_cfg::<f32>(1000.0),
+            0..10,
+        );
+        let second = run_one_range::<SignalScript, f32>(
+            prices.bars(),
+            &always_long,
+            (),
+            num_cfg::<f32>(1000.0),
+            10..20,
+        );
+
+        assert!(
+            (first.final_value - 998.5).abs() < 1e-2,
+            "flat segment keeps capital minus one entry fee, got {}",
+            first.final_value
+        );
+        assert!(
+            second.final_value > 1400.0,
+            "climbing segment should gain, got {}",
+            second.final_value
+        );
+    }
+
+    #[test]
+    fn run_one_reports_trades_exposure_and_win_rate() {
+        // Enter, ride a rise, exit; then enter, ride a fall, exit.
+        let close = vec![100.0_f32, 100.0, 200.0, 200.0, 200.0, 100.0, 100.0, 100.0];
+        let prices = bars_of(close.clone(), close.clone());
+        let signals = vec![
+            Signal::EnterLong, // fill at bar 1
+            Signal::Hold,
+            Signal::ExitLong, // fill at bar 3, after the rise
+            Signal::EnterLong,
+            Signal::Hold,
+            Signal::ExitLong, // fill at bar 6, after the fall
+            Signal::Hold,
+        ];
+
+        let m = run_one_range::<SignalScript, f32>(
+            prices.bars(),
+            &signals,
+            (),
+            num_cfg::<f32>(1000.0),
+            0..close.len(),
+        );
+
+        assert_eq!(m.trades, 2, "two completed round trips");
+        assert!((m.win_rate - 50.0).abs() < 1e-6, "one up, one down");
+        assert!(m.exposure > 0.0 && m.exposure < 100.0, "partly invested");
+        assert!(m.max_drawdown > 0.0, "the second trade lost money");
+    }
+
+    #[test]
+    fn an_open_position_at_the_last_bar_is_not_counted_as_a_trade() {
+        let close = vec![100.0_f32, 100.0, 110.0, 120.0];
+        let prices = bars_of(close.clone(), close.clone());
+        let signals = vec![Signal::EnterLong, Signal::Hold, Signal::Hold];
+
+        let m = run_one_range::<SignalScript, f32>(
+            prices.bars(),
+            &signals,
+            (),
+            num_cfg::<f32>(1000.0),
+            0..close.len(),
+        );
+        assert_eq!(m.trades, 0, "never exited, so nothing completed");
+        assert_eq!(m.win_rate, 0.0);
+        assert!(m.final_value > 1000.0, "but the equity still marked up");
     }
 
     #[test]
