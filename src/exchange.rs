@@ -161,6 +161,32 @@ pub struct K {
     pub high: f32,
     pub low: f32,
     pub close: f32,
+    /// Base-asset volume. `NaN` means "this cache predates volume support",
+    /// which is distinguishable from a genuine zero-volume bar; it backfills
+    /// on the next download.
+    #[serde(default = "unknown_volume")]
+    pub volume: f32,
+}
+
+/// Sentinel for a candle loaded from a cache written before volume existed.
+pub fn unknown_volume() -> f32 {
+    f32::NAN
+}
+
+#[cfg(test)]
+impl K {
+    /// A flat candle: open/high/low/close all `price`, volume `price`. Keeps
+    /// the many timestamp-focused tests from spelling out six fields each.
+    pub fn flat(time: u64, price: f32) -> Self {
+        Self {
+            time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: price,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +432,7 @@ impl KlineProvider for Binance {
                     high: parse_field(values, 2, "high price", item)?,
                     low: parse_field(values, 3, "low price", item)?,
                     close: parse_field(values, 4, "close price", item)?,
+                    volume: parse_field(values, 5, "volume", item)?,
                 });
             }
             Ok(result)
@@ -653,13 +680,7 @@ mod tests {
     }
 
     fn k(time: u64) -> K {
-        K {
-            time,
-            open: 1.0,
-            high: 1.0,
-            low: 1.0,
-            close: 1.0,
-        }
+        K::flat(time, 1.0)
     }
 
     #[tokio::test]

@@ -6,24 +6,28 @@ use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
 use std::borrow::Cow;
 
 fn synthetic_market(n: usize) -> CandleSeries {
-    let mut timestamps = Vec::with_capacity(n);
-    let mut open_prices = Vec::with_capacity(n);
-    let mut close_prices = Vec::with_capacity(n);
+    let mut market = CandleSeries {
+        timestamps: Vec::with_capacity(n),
+        open_prices: Vec::with_capacity(n),
+        high_prices: Vec::with_capacity(n),
+        low_prices: Vec::with_capacity(n),
+        close_prices: Vec::with_capacity(n),
+        volumes: Vec::with_capacity(n),
+    };
     for i in 0..n {
-        timestamps.push(i as u64 * 60_000);
+        market.timestamps.push(i as u64 * 60_000);
         let phase = (i as f32 / 30.0).sin();
         let close = 100.0 + 20.0 * phase;
         // Open shifted by a small constant so swapping `open_prices` and
         // `close_prices` in the execution path would observably change
         // the computed best result.
-        open_prices.push(close + 0.5);
-        close_prices.push(close);
+        market.open_prices.push(close + 0.5);
+        market.high_prices.push(close + 1.0);
+        market.low_prices.push(close - 1.0);
+        market.close_prices.push(close);
+        market.volumes.push(1_000.0 + i as f32);
     }
-    CandleSeries {
-        timestamps,
-        open_prices,
-        close_prices,
-    }
+    market
 }
 
 fn small_engine() -> EngineConfig {

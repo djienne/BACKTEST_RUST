@@ -5,6 +5,7 @@
 //! naturally returns `Flat` during warmup without an explicit guard.
 
 use crate::backtest::ema_parameter_pairs;
+use crate::data::Bars;
 use crate::precision::BacktestFloat;
 use crate::strategy::{Signal, Strategy};
 use crate::ta_wrapper::EMAStore;
@@ -25,12 +26,8 @@ impl Strategy for DoubleEmaCrossover {
     type Config = DoubleEmaConfig;
     const NAME: &'static str = "double_ema";
 
-    fn build_cache<T: BacktestFloat>(
-        _open: &[T],
-        close: &[T],
-        cfg: &Self::Config,
-    ) -> Self::Cache<T> {
-        EMAStore::new(close, cfg.fast_period_min, cfg.max_period)
+    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
+        EMAStore::new(bars.close, cfg.fast_period_min, cfg.max_period)
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -38,6 +35,7 @@ impl Strategy for DoubleEmaCrossover {
     }
 
     fn evaluator<'a, T: BacktestFloat>(
+        _bars: Bars<'a, T>,
         cache: &'a Self::Cache<T>,
         params: Self::Params,
     ) -> impl Fn(usize) -> Signal + 'a {
@@ -92,11 +90,12 @@ mod tests {
 
     #[test]
     fn evaluator_emits_enter_long_when_fast_crosses_above_slow() {
+        let prices = crate::data::OwnedBars::from_close(vec![1.0_f32; 4]);
         let cache = EMAStore::<f32>::from_series(
             1,
             vec![vec![f32::NAN, 2.0, 1.0, 1.0], vec![f32::NAN, 1.0, 2.0, 1.0]],
         );
-        let evaluator = DoubleEmaCrossover::evaluator::<f32>(&cache, (1, 2));
+        let evaluator = DoubleEmaCrossover::evaluator::<f32>(prices.bars(), &cache, (1, 2));
         // Index 0: NaN comparisons false in both directions → Hold (warmup).
         assert_eq!(evaluator(0), Signal::Hold);
         // Index 1: fast=2 > slow=1 → EnterLong.

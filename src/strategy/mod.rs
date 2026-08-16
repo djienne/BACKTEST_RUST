@@ -8,6 +8,7 @@
 //! functions (no `&self`); monomorphization collapses the trait dispatch
 //! to direct calls in the hot loop.
 
+use crate::data::Bars;
 use crate::precision::BacktestFloat;
 use std::cmp::Ordering;
 
@@ -44,15 +45,21 @@ pub trait Strategy {
 
     const NAME: &'static str;
 
-    fn build_cache<T: BacktestFloat>(open: &[T], close: &[T], cfg: &Self::Config)
-        -> Self::Cache<T>;
+    /// Precompute every indicator the parameter sweep will read. Called once
+    /// per run; the result is shared read-only across all worker threads.
+    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T>;
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params>;
 
     /// Build a per-bar evaluator closure with strategy-private lookups
     /// (e.g. slice-by-period) hoisted out of the hot loop. The engine
     /// calls the returned closure once per bar.
+    ///
+    /// Raw price columns arrive via `bars`, so a cache only ever holds
+    /// *derived* series — no strategy needs to copy the close series to read
+    /// it back later.
     fn evaluator<'a, T: BacktestFloat>(
+        bars: Bars<'a, T>,
         cache: &'a Self::Cache<T>,
         params: Self::Params,
     ) -> impl Fn(usize) -> Signal + 'a;

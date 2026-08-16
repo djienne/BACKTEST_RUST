@@ -403,17 +403,7 @@ mod tests {
     }
 
     fn small_klines(times: &[u64]) -> Vec<K> {
-        times
-            .iter()
-            .copied()
-            .map(|t| K {
-                time: t,
-                open: 1.0,
-                high: 1.0,
-                low: 1.0,
-                close: 1.0,
-            })
-            .collect()
+        times.iter().copied().map(|t| K::flat(t, 1.0)).collect()
     }
 
     #[test]
@@ -425,34 +415,10 @@ mod tests {
     #[test]
     fn normalize_klines_sorts_and_dedups() {
         let mut v = vec![
-            K {
-                time: 3,
-                open: 1.0,
-                high: 1.0,
-                low: 1.0,
-                close: 1.0,
-            },
-            K {
-                time: 1,
-                open: 2.0,
-                high: 2.0,
-                low: 2.0,
-                close: 2.0,
-            },
-            K {
-                time: 2,
-                open: 3.0,
-                high: 3.0,
-                low: 3.0,
-                close: 3.0,
-            },
-            K {
-                time: 1,
-                open: 4.0,
-                high: 4.0,
-                low: 4.0,
-                close: 4.0,
-            },
+            K::flat(3, 1.0),
+            K::flat(1, 2.0),
+            K::flat(2, 3.0),
+            K::flat(1, 4.0),
         ];
         let report = normalize_klines(&mut v);
         assert!(report.changed());
@@ -472,34 +438,10 @@ mod tests {
     #[test]
     fn normalize_klines_removes_only_consecutive_duplicates_after_sort() {
         let mut v = vec![
-            K {
-                time: 1,
-                open: 1.0,
-                high: 1.0,
-                low: 1.0,
-                close: 1.0,
-            },
-            K {
-                time: 1,
-                open: 9.0,
-                high: 9.0,
-                low: 9.0,
-                close: 9.0,
-            },
-            K {
-                time: 2,
-                open: 2.0,
-                high: 2.0,
-                low: 2.0,
-                close: 2.0,
-            },
-            K {
-                time: 1,
-                open: 5.0,
-                high: 5.0,
-                low: 5.0,
-                close: 5.0,
-            },
+            K::flat(1, 1.0),
+            K::flat(1, 9.0),
+            K::flat(2, 2.0),
+            K::flat(1, 5.0),
         ];
         let report = normalize_klines(&mut v);
         assert!(report.changed());
@@ -722,26 +664,15 @@ mod tests {
         // `2` came first and is stale, the re-fetched copy came second and is
         // the finished bar. The finished bar must win.
         let mut v = vec![
-            K {
-                time: 1,
-                open: 1.0,
-                high: 1.0,
-                low: 1.0,
-                close: 1.0,
-            },
-            K {
-                time: 2,
-                open: 9.0,
-                high: 9.0,
-                low: 9.0,
-                close: 9.0,
-            }, // stale
+            K::flat(1, 1.0),
+            K::flat(2, 9.0), // stale
             K {
                 time: 2,
                 open: 5.0,
                 high: 7.0,
                 low: 3.0,
                 close: 6.0,
+                volume: 42.0,
             }, // fresh
         ];
         let report = normalize_klines(&mut v);
@@ -783,16 +714,6 @@ mod tests {
         }
     }
 
-    fn candle(time: u64, close: f32) -> K {
-        K {
-            time,
-            open: close,
-            high: close,
-            low: close,
-            close,
-        }
-    }
-
     #[tokio::test]
     async fn incremental_download_repairs_a_stale_final_candle() {
         // The regression this covers end to end: an older build wrote the
@@ -806,13 +727,13 @@ mod tests {
         let newest_open = (now / hour) * hour - 5 * hour;
         let older_open = newest_open - hour;
 
-        let stale_cache = vec![candle(older_open, 100.0), candle(newest_open, 111.0)];
+        let stale_cache = vec![K::flat(older_open, 100.0), K::flat(newest_open, 111.0)];
         feather::write(&temp.paths.feather("ANY-USDT", &level), &stale_cache).unwrap();
 
         // The exchange's version of the same bar, plus one genuinely new bar.
         let provider = OnePageProvider::new(vec![
-            candle(newest_open + hour, 222.0),
-            candle(newest_open, 999.0),
+            K::flat(newest_open + hour, 222.0),
+            K::flat(newest_open, 999.0),
         ]);
 
         download_with_provider(&provider, &temp.paths, "ANY-USDT", level, 0u64.., false)

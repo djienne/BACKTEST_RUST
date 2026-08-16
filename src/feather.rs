@@ -1,11 +1,13 @@
 //! Apache Arrow IPC (Feather v2) read/write helpers for `Vec<K>`.
 //!
-//! Schema is fixed: one `RecordBatch` with five non-nullable columns
-//! (`time: UInt64`, `open/high/low/close: Float32`). Wrong schemas are
-//! rejected up front so a malformed cache file fails loudly at load time
-//! rather than producing garbage candles.
+//! The current schema is one `RecordBatch` with six non-nullable columns
+//! (`time: UInt64`, `open/high/low/close/volume: Float32`). Files written
+//! before volume support carry the same five leading columns and no sixth;
+//! those still load, with volume set to `NaN`. Anything else is rejected up
+//! front so a malformed cache fails loudly at load time rather than producing
+//! garbage candles.
 
-use crate::exchange::K;
+use crate::exchange::{unknown_volume, K};
 use anyhow::{anyhow, Context, Result};
 use arrow::array::{Array, Float32Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -21,15 +23,32 @@ const OPEN_FIELD: &str = "open";
 const HIGH_FIELD: &str = "high";
 const LOW_FIELD: &str = "low";
 const CLOSE_FIELD: &str = "close";
+const VOLUME_FIELD: &str = "volume";
 
-fn kline_schema() -> Schema {
-    Schema::new(vec![
+/// Which on-disk layout a cache file uses. Only ever produced by
+/// [`detect_schema`]; [`write`] always emits [`CacheSchema::WithVolume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSchema {
+    /// Pre-volume: five columns.
+    Legacy5Column,
+    /// Current: five columns plus `volume`.
+    WithVolume,
+}
+
+fn base_fields() -> Vec<Field> {
+    vec![
         Field::new(TIME_FIELD, DataType::UInt64, false),
         Field::new(OPEN_FIELD, DataType::Float32, false),
         Field::new(HIGH_FIELD, DataType::Float32, false),
         Field::new(LOW_FIELD, DataType::Float32, false),
         Field::new(CLOSE_FIELD, DataType::Float32, false),
-    ])
+    ]
+}
+
+fn kline_schema() -> Schema {
+    let mut fields = base_fields();
+    fields.push(Field::new(VOLUME_FIELD, DataType::Float32, false));
+    Schema::new(fields)
 }
 
 /// Write `candles` to `path` as a single-batch Feather v2 file.
@@ -48,6 +67,7 @@ pub fn write(path: &Path, candles: &[K]) -> Result<()> {
     let high = Float32Array::from_iter_values(candles.iter().map(|k| k.high));
     let low = Float32Array::from_iter_values(candles.iter().map(|k| k.low));
     let close = Float32Array::from_iter_values(candles.iter().map(|k| k.close));
+    let volume = Float32Array::from_iter_values(candles.iter().map(|k| k.volume));
 
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -57,6 +77,7 @@ pub fn write(path: &Path, candles: &[K]) -> Result<()> {
             Arc::new(high),
             Arc::new(low),
             Arc::new(close),
+            Arc::new(volume),
         ],
     )
     .context("failed to build RecordBatch for kline cache")?;
@@ -104,13 +125,19 @@ pub fn read(path: &Path) -> Result<Vec<K>> {
     let reader = FileReader::try_new(reader, None)
         .with_context(|| format!("failed to open feather reader for {}", path.display()))?;
 
-    validate_schema(reader.schema().as_ref(), path)?;
+    let schema = detect_schema(reader.schema().as_ref(), path)?;
+    if schema == CacheSchema::Legacy5Column {
+        eprintln!(
+            "Note: {} predates volume support; volume reads as NaN until the cache is re-downloaded.",
+            path.display()
+        );
+    }
 
     let mut out: Vec<K> = Vec::new();
     for (idx, batch) in reader.enumerate() {
         let batch =
             batch.with_context(|| format!("failed to read batch {idx} from {}", path.display()))?;
-        append_batch(&mut out, &batch, path)?;
+        append_batch(&mut out, &batch, path, schema)?;
     }
     Ok(out)
 }
@@ -124,7 +151,7 @@ pub fn read_last_time(path: &Path) -> Result<u64> {
     let reader = FileReader::try_new(reader, None)
         .with_context(|| format!("failed to open feather reader for {}", path.display()))?;
 
-    validate_schema(reader.schema().as_ref(), path)?;
+    detect_schema(reader.schema().as_ref(), path)?;
 
     let mut max: Option<u64> = None;
     for (idx, batch) in reader.enumerate() {
@@ -154,17 +181,24 @@ pub fn read_last_time(path: &Path) -> Result<u64> {
     max.ok_or_else(|| anyhow!("feather file has no candles: {}", path.display()))
 }
 
-fn validate_schema(actual: &Schema, path: &Path) -> Result<()> {
+/// Identify the on-disk layout, rejecting anything that is neither the current
+/// schema nor the pre-volume one. The five leading columns must match exactly
+/// in both cases — a file that disagrees there is not a kline cache.
+fn detect_schema(actual: &Schema, path: &Path) -> Result<CacheSchema> {
     let expected = kline_schema();
-    if actual.fields().len() != expected.fields().len() {
-        return Err(anyhow!(
-            "{}: expected {} columns, got {}",
-            path.display(),
-            expected.fields().len(),
-            actual.fields().len()
-        ));
-    }
-    for (got, want) in actual.fields().iter().zip(expected.fields().iter()) {
+    let expected_fields = expected.fields();
+    let schema = match actual.fields().len() {
+        6 => CacheSchema::WithVolume,
+        5 => CacheSchema::Legacy5Column,
+        other => {
+            return Err(anyhow!(
+                "{}: expected 6 columns (or 5 for a pre-volume cache), got {other}",
+                path.display(),
+            ))
+        }
+    };
+
+    for (got, want) in actual.fields().iter().zip(expected_fields.iter()) {
         if got.name() != want.name()
             || got.data_type() != want.data_type()
             || got.is_nullable() != want.is_nullable()
@@ -181,15 +215,24 @@ fn validate_schema(actual: &Schema, path: &Path) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(schema)
 }
 
-fn append_batch(out: &mut Vec<K>, batch: &RecordBatch, path: &Path) -> Result<()> {
+fn append_batch(
+    out: &mut Vec<K>,
+    batch: &RecordBatch,
+    path: &Path,
+    schema: CacheSchema,
+) -> Result<()> {
     let time = downcast_u64(batch, 0, path)?;
     let open = downcast_f32(batch, 1, path)?;
     let high = downcast_f32(batch, 2, path)?;
     let low = downcast_f32(batch, 3, path)?;
     let close = downcast_f32(batch, 4, path)?;
+    let volume = match schema {
+        CacheSchema::WithVolume => Some(downcast_f32(batch, 5, path)?),
+        CacheSchema::Legacy5Column => None,
+    };
 
     let n = batch.num_rows();
     out.reserve(n);
@@ -200,6 +243,7 @@ fn append_batch(out: &mut Vec<K>, batch: &RecordBatch, path: &Path) -> Result<()
             high: high.value(i),
             low: low.value(i),
             close: close.value(i),
+            volume: volume.map_or_else(unknown_volume, |column| column.value(i)),
         });
     }
     Ok(())
@@ -257,8 +301,82 @@ mod tests {
                 high: 200.0 + i as f32,
                 low: 50.0 + i as f32,
                 close: 150.0 + i as f32,
+                volume: 10.0 + i as f32,
             })
             .collect()
+    }
+
+    /// Write a file in the pre-volume five-column layout, as builds before
+    /// volume support produced.
+    fn write_legacy_5_column(path: &Path, candles: &[K]) {
+        let schema = Arc::new(Schema::new(base_fields()));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(
+                    candles.iter().map(|k| k.time),
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    candles.iter().map(|k| k.open),
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    candles.iter().map(|k| k.high),
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    candles.iter().map(|k| k.low),
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    candles.iter().map(|k| k.close),
+                )),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = FileWriter::try_new(file, schema.as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn legacy_five_column_caches_still_load_with_unknown_volume() {
+        let path = temp_path("legacy_schema");
+        let candles = sample(5);
+        write_legacy_5_column(&path, &candles);
+
+        let back = read(&path).expect("a pre-volume cache must still load");
+        assert_eq!(back.len(), candles.len());
+        for (got, want) in back.iter().zip(candles.iter()) {
+            assert_eq!(got.time, want.time);
+            assert_eq!(got.close, want.close);
+            assert_eq!(got.high, want.high);
+            assert!(got.volume.is_nan(), "absent volume must read as NaN");
+        }
+        // The freshness probe has to accept the old layout too, or an upgrade
+        // would look like a corrupt cache and trigger a full re-download.
+        assert_eq!(read_last_time(&path).unwrap(), candles.last().unwrap().time);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewriting_a_legacy_cache_upgrades_it_to_the_current_schema() {
+        let path = temp_path("legacy_upgrade");
+        let mut candles = sample(4);
+        write_legacy_5_column(&path, &candles);
+
+        // Simulate the download path: read, backfill, write back.
+        let loaded = read(&path).unwrap();
+        assert!(loaded.iter().all(|k| k.volume.is_nan()));
+        for (candle, source) in candles.iter_mut().zip(loaded.iter()) {
+            candle.time = source.time;
+        }
+        write(&path, &candles).unwrap();
+
+        let back = read(&path).unwrap();
+        assert_eq!(
+            back, candles,
+            "volume survives the round trip after upgrade"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -289,6 +407,7 @@ mod tests {
             high: 2.0,
             low: 0.5,
             close: 1.5,
+            volume: 3.25,
         }];
         write(&path, &one).unwrap();
         let back = read(&path).unwrap();
@@ -402,6 +521,35 @@ mod tests {
             msg.contains("nullable"),
             "expected nullability complaint, got: {msg}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_rejects_an_unrecognised_column_count() {
+        let path = temp_path("four_columns");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::UInt64, false),
+            Field::new("open", DataType::Float32, false),
+            Field::new("high", DataType::Float32, false),
+            Field::new("low", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from_iter_values([1u64, 2])),
+                Arc::new(Float32Array::from_iter_values([1.0f32, 2.0])),
+                Arc::new(Float32Array::from_iter_values([1.0f32, 2.0])),
+                Arc::new(Float32Array::from_iter_values([1.0f32, 2.0])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = FileWriter::try_new(file, schema.as_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+
+        let msg = format!("{:#}", read(&path).unwrap_err());
+        assert!(msg.contains("columns"), "got: {msg}");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! This is a seam-validating stub — not wired into the CLI. Its purpose is
 //! to prove the `Strategy` trait works for a strategy with a 1-parameter
-//! sweep and a cache that combines the shared `EMAStore` with strategy-
-//! private state (the `close` series).
+//! sweep that combines a precomputed indicator with a raw price column.
 
+use crate::data::Bars;
 use crate::precision::BacktestFloat;
 use crate::strategy::{Signal, Strategy};
 use crate::ta_wrapper::EMAStore;
@@ -18,26 +18,14 @@ pub struct PriceVsEmaConfig {
     pub period_max: usize,
 }
 
-pub struct PriceVsEmaCache<T> {
-    pub ema: EMAStore<T>,
-    pub close: Vec<T>,
-}
-
 impl Strategy for PriceVsEma {
     type Params = usize;
-    type Cache<T: BacktestFloat> = PriceVsEmaCache<T>;
+    type Cache<T: BacktestFloat> = EMAStore<T>;
     type Config = PriceVsEmaConfig;
     const NAME: &'static str = "price_vs_ema";
 
-    fn build_cache<T: BacktestFloat>(
-        _open: &[T],
-        close: &[T],
-        cfg: &Self::Config,
-    ) -> Self::Cache<T> {
-        PriceVsEmaCache {
-            ema: EMAStore::new(close, cfg.period_min, cfg.period_max),
-            close: close.to_vec(),
-        }
+    fn build_cache<T: BacktestFloat>(bars: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
+        EMAStore::new(bars.close, cfg.period_min, cfg.period_max)
     }
 
     fn enumerate_params(cfg: &Self::Config) -> Vec<Self::Params> {
@@ -45,14 +33,14 @@ impl Strategy for PriceVsEma {
     }
 
     fn evaluator<'a, T: BacktestFloat>(
+        bars: Bars<'a, T>,
         cache: &'a Self::Cache<T>,
         params: Self::Params,
     ) -> impl Fn(usize) -> Signal + 'a {
         let ema = cache
-            .ema
             .get_ema(params)
             .unwrap_or_else(|| panic!("EMA store missing period {params}"));
-        let close = cache.close.as_slice();
+        let close = bars.close;
         move |bar_index| {
             let close_value = close[bar_index];
             let ema_value = ema[bar_index];
@@ -78,18 +66,13 @@ impl Strategy for PriceVsEma {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn cache_with(close: Vec<f32>, ema: Vec<f32>) -> PriceVsEmaCache<f32> {
-        PriceVsEmaCache {
-            ema: EMAStore::<f32>::from_series(1, vec![ema]),
-            close,
-        }
-    }
+    use crate::data::OwnedBars;
 
     #[test]
     fn evaluator_enters_long_when_close_above_ema() {
-        let cache = cache_with(vec![100.0, 110.0, 120.0], vec![100.0, 105.0, 115.0]);
-        let evaluator = PriceVsEma::evaluator::<f32>(&cache, 1);
+        let prices = OwnedBars::from_close(vec![100.0_f32, 110.0, 120.0]);
+        let cache = EMAStore::<f32>::from_series(1, vec![vec![100.0, 105.0, 115.0]]);
+        let evaluator = PriceVsEma::evaluator::<f32>(prices.bars(), &cache, 1);
         assert_eq!(evaluator(0), Signal::Hold); // 100 == 100
         assert_eq!(evaluator(1), Signal::EnterLong); // 110 > 105
         assert_eq!(evaluator(2), Signal::EnterLong); // 120 > 115
@@ -97,8 +80,9 @@ mod tests {
 
     #[test]
     fn evaluator_exits_when_close_falls_below_ema() {
-        let cache = cache_with(vec![110.0, 100.0], vec![105.0, 105.0]);
-        let evaluator = PriceVsEma::evaluator::<f32>(&cache, 1);
+        let prices = OwnedBars::from_close(vec![110.0_f32, 100.0]);
+        let cache = EMAStore::<f32>::from_series(1, vec![vec![105.0, 105.0]]);
+        let evaluator = PriceVsEma::evaluator::<f32>(prices.bars(), &cache, 1);
         assert_eq!(evaluator(0), Signal::EnterLong);
         assert_eq!(evaluator(1), Signal::ExitLong);
     }

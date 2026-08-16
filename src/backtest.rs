@@ -1,4 +1,4 @@
-use crate::data::CandleSeries;
+use crate::data::{Bars, CandleSeries, MarketArrays};
 use crate::exchange::Level;
 use crate::metrics::{max_drawdown, sharpe_ratio};
 use crate::precision::{BacktestFloat, Float, Precision, ACTIVE_PRECISION};
@@ -154,12 +154,12 @@ fn numeric_backtest_config<T: BacktestFloat>(engine: &EngineConfig) -> NumericBa
 /// (so `S::evaluator` is monomorphized + inlined into the hot loop) and
 /// over the float precision.
 pub fn run_one<S: Strategy, T: BacktestFloat>(
-    open: &[T],
-    close: &[T],
+    bars: Bars<'_, T>,
     cache: &S::Cache<T>,
     params: S::Params,
     cfg: NumericBacktestConfig<T>,
 ) -> BacktestMetrics {
+    let (open, close) = (bars.open, bars.close);
     // `run` rejects mismatched inputs up front; the assert keeps that contract
     // visible here, and the `min` keeps a release build safely truncating
     // rather than indexing past an end.
@@ -172,7 +172,7 @@ pub fn run_one<S: Strategy, T: BacktestFloat>(
             sharpe_ratio: 0.0,
         };
     }
-    let evaluator = S::evaluator::<T>(cache, params);
+    let evaluator = S::evaluator::<T>(bars, cache, params);
 
     let mut usdt: T = cfg.starting_capital;
     let mut qty: T = T::ZERO;
@@ -238,12 +238,11 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
     pool: &rayon::ThreadPool,
     engine: &EngineConfig,
     strategy_config: &S::Config,
-    open: &[T],
-    close: &[T],
+    bars: Bars<'_, T>,
     parameter_set: &[S::Params],
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
     println!("Calculating all indicators for {}...", ACTIVE_PRECISION);
-    let cache = S::build_cache::<T>(open, close, strategy_config);
+    let cache = S::build_cache::<T>(bars, strategy_config);
     let backtest_config = numeric_backtest_config::<T>(engine);
 
     println!("Calculated all indicators for {}.", ACTIVE_PRECISION);
@@ -264,7 +263,7 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                 .fold(
                     || None::<SweepResult<S::Params>>,
                     |acc, &params| {
-                        let metrics = run_one::<S, T>(open, close, &cache, params, backtest_config);
+                        let metrics = run_one::<S, T>(bars, &cache, params, backtest_config);
 
                         let count = progress_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                         if engine.show_progress
@@ -303,35 +302,30 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
     })
 }
 
-#[cfg(all(feature = "f32", not(feature = "f64")))]
-fn to_active_floats(prices: &[f32]) -> Vec<Float> {
-    prices.to_vec()
-}
-
-#[cfg(all(feature = "f64", not(feature = "f32")))]
-fn to_active_floats(prices: &[f32]) -> Vec<Float> {
-    prices.iter().copied().map(f64::from).collect()
-}
-
 pub fn run<S: Strategy>(
     engine: &EngineConfig,
     strategy_config: &S::Config,
     market: &CandleSeries,
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
-    // A length mismatch means the loader or the caller is broken. Failing here
+    // A ragged series means the loader or the caller is broken. Failing here
     // is the whole point: silently backtesting the shorter prefix would return
     // a plausible-looking result for data that does not exist.
-    if market.open_prices.len() != market.close_prices.len() {
+    if !market.is_rectangular() {
         anyhow::bail!(
-            "malformed market data: {} open prices but {} close prices",
+            "malformed market data: columns disagree in length \
+             (timestamps={}, open={}, high={}, low={}, close={}, volume={})",
+            market.timestamps.len(),
             market.open_prices.len(),
-            market.close_prices.len()
+            market.high_prices.len(),
+            market.low_prices.len(),
+            market.close_prices.len(),
+            market.volumes.len(),
         );
     }
-    if market.close_prices.len() < 2 {
+    if market.len() < 2 {
         anyhow::bail!(
             "not enough candles to backtest: {} (need at least 2)",
-            market.close_prices.len()
+            market.len()
         );
     }
 
@@ -341,16 +335,13 @@ pub fn run<S: Strategy>(
         .context("failed to construct rayon thread pool")?;
 
     let parameter_set = S::enumerate_params(strategy_config);
-
-    let open = to_active_floats(&market.open_prices);
-    let close = to_active_floats(&market.close_prices);
+    let arrays = MarketArrays::<Float>::from_series(market);
 
     run_precision_sweep_impl::<S, Float>(
         &pool,
         engine,
         strategy_config,
-        &open,
-        &close,
+        arrays.bars(),
         &parameter_set,
     )
 }
@@ -358,8 +349,16 @@ pub fn run<S: Strategy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::OwnedBars;
     use crate::strategy::double_ema::DoubleEmaCrossover;
     use crate::ta_wrapper::EMAStore;
+
+    /// Bars with independent open and close columns — the execution model
+    /// fills at the *next* open and marks at that bar's close, so the two must
+    /// be distinguishable for these tests to mean anything.
+    fn bars_of<T: BacktestFloat>(open: Vec<T>, close: Vec<T>) -> OwnedBars<T> {
+        OwnedBars::ohlc(open, close.clone(), close.clone(), close)
+    }
 
     fn num_cfg<T: BacktestFloat>(starting: f32) -> NumericBacktestConfig<T> {
         NumericBacktestConfig {
@@ -378,10 +377,10 @@ mod tests {
         let ema_fast = vec![f32::NAN, 2.0, 2.0];
         let ema_slow = vec![f32::NAN, 1.0, 1.0];
         let cache = EMAStore::<f32>::from_series(1, vec![ema_fast, ema_slow]);
+        let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f32>(
-            &open_prices,
-            &close_prices,
+            prices.bars(),
             &cache,
             (1, 2),
             num_cfg::<f32>(1000.0),
@@ -397,10 +396,10 @@ mod tests {
         let ema_fast = vec![f32::NAN, 2.0, 2.0, 2.0, 1.0, 1.0];
         let ema_slow = vec![f32::NAN, 1.0, 1.0, 1.0, 2.0, 2.0];
         let cache = EMAStore::<f32>::from_series(1, vec![ema_fast, ema_slow]);
+        let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f32>(
-            &open_prices,
-            &close_prices,
+            prices.bars(),
             &cache,
             (1, 2),
             num_cfg::<f32>(1000.0),
@@ -422,10 +421,10 @@ mod tests {
         let ema_fast = vec![f64::NAN, 2.0, 2.0];
         let ema_slow = vec![f64::NAN, 1.0, 1.0];
         let cache = EMAStore::<f64>::from_series(1, vec![ema_fast, ema_slow]);
+        let prices = bars_of(open_prices, close_prices);
 
         let metrics = run_one::<DoubleEmaCrossover, f64>(
-            &open_prices,
-            &close_prices,
+            prices.bars(),
             &cache,
             (1, 2),
             num_cfg::<f64>(1000.0),
@@ -445,11 +444,7 @@ mod tests {
             type Config = Vec<Signal>;
             const NAME: &'static str = "test";
 
-            fn build_cache<T: BacktestFloat>(
-                _: &[T],
-                _: &[T],
-                cfg: &Self::Config,
-            ) -> Self::Cache<T> {
+            fn build_cache<T: BacktestFloat>(_: Bars<'_, T>, cfg: &Self::Config) -> Self::Cache<T> {
                 cfg.clone()
             }
 
@@ -458,6 +453,7 @@ mod tests {
             }
 
             fn evaluator<'a, T: BacktestFloat>(
+                _: Bars<'a, T>,
                 cache: &'a Self::Cache<T>,
                 _: (),
             ) -> impl Fn(usize) -> Signal + 'a {
@@ -480,14 +476,10 @@ mod tests {
         let open_prices = vec![100.0_f32, 100.0, 200.0, 100.0];
         let close_prices = vec![100.0_f32, 100.0, 200.0, 100.0];
         let cache: Vec<Signal> = vec![Signal::Hold, Signal::EnterLong, Signal::Hold];
+        let prices = bars_of(open_prices, close_prices);
 
-        let metrics = run_one::<TestStrategy, f32>(
-            &open_prices,
-            &close_prices,
-            &cache,
-            (),
-            num_cfg::<f32>(1000.0),
-        );
+        let metrics =
+            run_one::<TestStrategy, f32>(prices.bars(), &cache, (), num_cfg::<f32>(1000.0));
 
         assert!(
             (metrics.final_value - 499.25).abs() < 1e-3,
