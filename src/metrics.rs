@@ -1,3 +1,29 @@
+//! Performance statistics for an equity curve.
+//!
+//! Two forms of the same arithmetic, deliberately:
+//!
+//! - **Slice functions** ([`max_drawdown`], [`sharpe_ratio`]) take the whole
+//!   series. Clear, and easy to check by hand — they are what the streaming
+//!   form is tested against.
+//! - **[`EquityStats`]** consumes one bar at a time and keeps running scalars.
+//!   The sweep evaluates it once per parameter tuple over the whole series, so
+//!   materializing an equity curve there would dominate the program's
+//!   allocation.
+//!
+//! [`annualize_sharpe`] is the shared tail of both, so they cannot drift apart.
+//!
+//! # Conventions
+//!
+//! Drawdown, CAGR, win rate and exposure are percentages; Sharpe, Sortino and
+//! Calmar are unitless ratios. Risk-free rates are **per bar**, in the same
+//! units as the returns.
+//!
+//! Degenerate cases return `0.0` rather than `NaN` or `inf`, with one
+//! deliberate exception: [`EquityStats::sortino`] reports `inf` for a run that
+//! never had a losing bar, because reporting `0` there would rank a flawless
+//! run as the worst in the sweep. Sharpe keeps the conservative guard, since
+//! Sharpe is the ranking key.
+
 use crate::precision::BacktestFloat;
 
 pub fn max_drawdown<T: BacktestFloat>(portfolio_values: &[T]) -> f64 {

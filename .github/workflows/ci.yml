@@ -26,6 +26,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --no-default-features --features f64 -- -D warnings
 
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches doc links that rot when an item is renamed or moved. The
+      # README's own accuracy is covered by tests, not here:
+      # `the_readme_quotes_the_help_output_exactly` and
+      # `the_readme_lists_every_registered_strategy`.
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: >-
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::private_intra_doc_links
+            -D rustdoc::invalid_html_tags
+            -D rustdoc::bare_urls
+
   test:
     runs-on: ubuntu-latest
     strategy:

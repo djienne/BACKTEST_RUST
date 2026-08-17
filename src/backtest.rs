@@ -1,3 +1,31 @@
+//! The sweep engine: run one backtest per parameter tuple and keep the best.
+//!
+//! The engine is generic over [`Strategy`], so `S::evaluator` monomorphizes
+//! and inlines into the per-bar loop rather than dispatching through a vtable.
+//! It knows nothing about any particular indicator.
+//!
+//! # What gets ranked
+//!
+//! Candidates are ordered by Sharpe ratio, then final value, then the
+//! strategy's own [`Strategy::tie_break`]. That last step is what makes a run
+//! reproducible: without it, two parameter tuples with identical metrics would
+//! be separated by whichever rayon thread happened to finish first.
+//!
+//! # In-sample versus held-out
+//!
+//! With [`EngineConfig::split`] set, the sweep optimizes over a leading range
+//! of bars and the winner is re-scored on the remainder. Indicators are always
+//! built over the *whole* series and the segment is expressed as a bar range
+//! (see [`run_one_range`]), so the held-out window starts with its warmup
+//! behind it rather than a fresh, invalid one.
+//!
+//! # Cost
+//!
+//! The hot loop is memory-bandwidth-bound on the indicator cache, so it
+//! allocates nothing per parameter tuple: equity statistics accumulate as
+//! running scalars in [`crate::metrics::EquityStats`] rather than as a
+//! materialized equity curve.
+
 use crate::data::{Bars, CandleSeries, MarketArrays};
 use crate::exchange::Level;
 use crate::metrics::{calmar_ratio, EquityStats};

@@ -1,3 +1,17 @@
+//! Command-line entry point.
+//!
+//! Parses arguments, refreshes the candle cache, hands the market to a
+//! strategy chosen by name, and prints and records the result.
+//!
+//! This file names **no concrete strategy**: dispatch goes through
+//! [`backtest_rust::strategy::registry`], which is what keeps adding a
+//! strategy from touching the CLI. The one exception is
+//! [`backtest_rust::strategy::registry::DEFAULT_STRATEGY`], used when
+//! `--strategy` is absent.
+//!
+//! The argument parser is hand-rolled rather than pulled from a crate: the
+//! surface is a dozen flags, and the dependency list is deliberately short.
+
 use anyhow::Context as _;
 use backtest_rust::backtest::{BacktestMetrics, EngineConfig, ExecutionModel};
 use backtest_rust::data::{load_data_file, DataPaths};
@@ -255,7 +269,16 @@ fn print_strategies() {
 }
 
 fn print_usage() {
-    println!(
+    println!("{}", usage_text());
+}
+
+/// The `--help` text.
+///
+/// Returned rather than printed so the test below can assert that the CLI
+/// reference in `README.md` is this exact text. Two copies of a flag list is
+/// how documentation starts lying.
+fn usage_text() -> String {
+    format!(
         "Usage: backtest_rust [SUBCOMMAND] [OPTIONS]\n\n\
          Subcommands:\n  \
            download              Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).\n  \
@@ -276,7 +299,7 @@ fn print_usage() {
          Environment variables:\n  \
            BACKTEST_SHOW_PROGRESS=0|1   Toggle per-iteration progress log\n  \
            BACKTEST_FORCE_DOWNLOAD=0|1  Alternative to --force for the default mode"
-    );
+    )
 }
 
 fn load_engine_config() -> anyhow::Result<EngineConfig> {
@@ -445,6 +468,21 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The README's CLI section must be the real `--help` text, verbatim.
+    /// Without this the two drift apart quietly, and a flag list that is
+    /// almost right is worse than none.
+    #[test]
+    fn the_readme_quotes_the_help_output_exactly() {
+        // Git may check the README out with CRLF; compare on content only.
+        let readme = include_str!("../README.md").replace('\r', "");
+        let usage = usage_text().replace('\r', "");
+        assert!(
+            readme.contains(&usage),
+            "README.md is out of date with --help. Replace its CLI reference \
+             block with:\n\n{usage}\n"
+        );
+    }
 
     #[test]
     fn parse_env_bool_understands_common_values() {

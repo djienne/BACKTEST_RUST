@@ -2,8 +2,9 @@
 //!
 //! Supertrend's bands ratchet, so each `(period, multiplier)` pair has its own
 //! path-dependent series and cannot share one with its neighbours. That makes
-//! this the [`SeriesCache`] case rather than the [`PeriodCache`] case — see the
-//! note on `SeriesCache` for why the distinction matters for memory.
+//! this the [`SeriesCache`] case rather than the
+//! [`PeriodCache`](crate::indicators::PeriodCache) case — see the note on
+//! [`SeriesCache`] for why the distinction matters for memory.
 
 use crate::data::Bars;
 use crate::indicators::volatility::supertrend;

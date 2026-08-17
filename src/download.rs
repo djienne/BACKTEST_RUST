@@ -1,3 +1,23 @@
+//! Cache policy: when to download, what to merge, and what never to keep.
+//!
+//! # Freshness
+//!
+//! Measured from the newest candle *inside* the file, not the file's mtime,
+//! and scaled to the timeframe: a cache is stale once a newer bar has
+//! certainly closed. A flat wall-clock threshold would let a 15m backtest run
+//! on data hundreds of candles old.
+//!
+//! # Merging
+//!
+//! The incremental fetch deliberately restarts *at* the newest cached candle
+//! rather than one millisecond past it, and [`normalize_klines`] keeps the
+//! **last** of any duplicate timestamp. Together those let a bar that an older
+//! build stored while it was still forming be replaced by the finished one.
+//! `--force` rebuilds a cache outright.
+//!
+//! See [`crate::exchange::candle_is_closed`] for the other half of that fix:
+//! the still-forming candle is dropped before it ever reaches the merge.
+
 use crate::data::DataPaths;
 use crate::exchange::{get_k_range, Binance, KlineProvider, Level, TimeRange, K};
 use crate::feather;

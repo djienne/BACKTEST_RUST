@@ -1,3 +1,30 @@
+//! Binance spot kline client, and the candle types everything else speaks.
+//!
+//! [`KlineProvider`] is the seam: [`Binance`] is the live implementation, and
+//! tests substitute a fake so pagination and cache-merge behaviour can be
+//! exercised without the network.
+//!
+//! # Pagination
+//!
+//! Binance's `/klines` endpoint is queried backwards from an inclusive
+//! `endTime`, one 1500-candle page at a time, until a page reaches past the
+//! requested start. Each page advances the cursor one millisecond past its
+//! oldest candle, because `endTime` is inclusive and would otherwise refetch
+//! it forever.
+//!
+//! # Retries
+//!
+//! Non-success statuses are classified rather than fed to the JSON parser:
+//! 429 and 418 are retried honouring `Retry-After` (capped), 5xx backs off
+//! exponentially, and any other 4xx fails immediately — a bad symbol will fail
+//! identically however many times it is asked.
+//!
+//! # Unclosed candles
+//!
+//! The API happily returns the currently forming bar, whose OHLC is still
+//! moving. [`candle_is_closed`] identifies those and [`get_k_range`] drops
+//! them, so a half-formed bar is never written into a cache.
+
 use anyhow::{anyhow, Context, Result};
 use chrono::{Months, TimeZone, Utc};
 use reqwest::StatusCode;

@@ -205,6 +205,27 @@ mod tests {
         }
     }
 
+    /// Registering a strategy without documenting it is the most likely way
+    /// for the README to fall behind, so it fails the build instead.
+    #[test]
+    fn the_readme_lists_every_registered_strategy() {
+        let readme = include_str!("../../README.md");
+        for info in available() {
+            assert!(
+                readme.contains(info.name),
+                "README.md does not mention the '{}' strategy",
+                info.name
+            );
+            for (parameter, _) in info.parameters {
+                assert!(
+                    readme.contains(parameter),
+                    "README.md does not mention '{}''s --param {parameter}",
+                    info.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn strategy_names_are_unique() {
         let mut names: Vec<&str> = available().iter().map(|info| info.name).collect();

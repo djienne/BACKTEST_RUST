@@ -25,8 +25,8 @@ const LOW_FIELD: &str = "low";
 const CLOSE_FIELD: &str = "close";
 const VOLUME_FIELD: &str = "volume";
 
-/// Which on-disk layout a cache file uses. Only ever produced by
-/// [`detect_schema`]; [`write`] always emits [`CacheSchema::WithVolume`].
+/// Which on-disk layout a cache file uses. Produced only when reading;
+/// [`write()`] always emits [`CacheSchema::WithVolume`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheSchema {
     /// Pre-volume: five columns.

@@ -1,3 +1,19 @@
+//! The in-memory market data model, and where files live.
+//!
+//! Three representations, each with a job:
+//!
+//! - [`CandleSeries`] — one owned `Vec` per column, in `f32`, as loaded from
+//!   the cache. This is what a loader produces and what tests construct.
+//! - [`MarketArrays`] — the same columns widened to the build's precision,
+//!   once per run.
+//! - [`Bars`] — a borrowed, `Copy` view of those columns. This is the type
+//!   indicators and strategies actually read, so adding an indicator that
+//!   needs a new column is a change here and nowhere else.
+//!
+//! [`DataPaths`] holds the cache and results directories explicitly rather
+//! than as process-relative constants, which is what lets tests use scratch
+//! directories and the CLI offer `--data-dir` / `--results-dir`.
+
 use crate::download::load_k_lines;
 use crate::exchange::Level;
 use crate::precision::BacktestFloat;

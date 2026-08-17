@@ -139,27 +139,33 @@ fail fast on a 4xx that will never succeed (a bad symbol).
 
 ## CLI reference
 
-```
+<!-- This block is asserted to equal `--help` verbatim by
+     `main::tests::the_readme_quotes_the_help_output_exactly`. -->
+
+```text
+Usage: backtest_rust [SUBCOMMAND] [OPTIONS]
+
 Subcommands:
-  download              Download klines, then exit. Always re-downloads.
-  list-strategies       Print the strategies and their parameters, then exit
+  download              Download historical klines, then exit (no sweep). Always re-downloads (bypasses the freshness guard).
+  list-strategies       Print the available strategies and their parameters, then exit
 
 Options:
-  --strategy <NAME>     Strategy to sweep (default: double_ema)
+  --strategy <NAME>     Strategy to sweep (default: double_ema; see list-strategies)
   --param <NAME=VALUE>  Strategy parameter; repeatable. Ranges are min..max
-  --pair <BASE-QUOTE>   Trading pair (default: BTC-USDT)
-  --level <INTERVAL>    1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)
+  --pair <BASE-QUOTE>   Trading pair, e.g. BTC-USDT (default: BTC-USDT)
+  --level <INTERVAL>    Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)
   --threads <N>         Rayon worker threads; 0 = auto (default: 1)
-  --split <FRACTION>    Optimize on the leading FRACTION, report on the rest
   --force               Bypass the freshness guard and re-download
   --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)
+  --split <FRACTION>    Optimize on the leading FRACTION of candles and
+                         report the winner on the held-out remainder
   --data-dir <PATH>     Kline cache directory (default: dataKLines)
   --results-dir <PATH>  Results CSV directory (default: results)
   -h, --help            Show this message
 
-Environment:
-  BACKTEST_SHOW_PROGRESS=0|1   Toggle progress logging
-  BACKTEST_FORCE_DOWNLOAD=0|1  Alternative to --force
+Environment variables:
+  BACKTEST_SHOW_PROGRESS=0|1   Toggle per-iteration progress log
+  BACKTEST_FORCE_DOWNLOAD=0|1  Alternative to --force for the default mode
 ```
 
 **Full history.** Binance's BTC/USDT spot pair started trading on 2017-08-17,
