@@ -18,11 +18,10 @@
 //! Calmar are unitless ratios. Risk-free rates are **per bar**, in the same
 //! units as the returns.
 //!
-//! Degenerate cases return `0.0` rather than `NaN` or `inf`, with one
-//! deliberate exception: [`EquityStats::sortino`] reports `inf` for a run that
-//! never had a losing bar, because reporting `0` there would rank a flawless
-//! run as the worst in the sweep. Sharpe keeps the conservative guard, since
-//! Sharpe is the ranking key.
+//! Undefined ratios generally return `0.0`. [`EquityStats::sortino`] reports
+//! `inf` when excess return is positive and no bar falls below its target;
+//! only Sharpe participates in sweep ranking. Zero ending equity gives a
+//! CAGR of -100% when starting capital and duration are valid.
 
 use crate::precision::BacktestFloat;
 
@@ -229,9 +228,10 @@ impl EquityStats {
         annualize_sharpe(mean_excess, downside_variance, periods_per_year)
     }
 
-    /// Compound annual growth rate, as a percentage.
+    /// Compound annual growth rate, as a percentage, using nominal bars/year.
+    /// Zero ending equity is a complete loss (-100%), not zero growth.
     pub fn cagr_pct(&self, starting_capital: f64, bars: usize, periods_per_year: usize) -> f64 {
-        if periods_per_year == 0 || bars == 0 || starting_capital <= 0.0 || self.last_value <= 0.0 {
+        if periods_per_year == 0 || bars == 0 || starting_capital <= 0.0 || self.last_value < 0.0 {
             return 0.0;
         }
         let years = bars as f64 / periods_per_year as f64;
@@ -456,8 +456,8 @@ mod tests {
         assert!(stats.sharpe(0.0, 365).is_finite());
         assert_eq!(
             stats.cagr_pct(1000.0, 4, 365),
-            0.0,
-            "no positive final value"
+            -100.0,
+            "complete loss of capital"
         );
     }
 }

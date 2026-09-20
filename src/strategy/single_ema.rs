@@ -1,8 +1,7 @@
 ﻿//! Price-vs-EMA threshold: long when close > EMA, flat otherwise.
 //!
-//! This is a seam-validating stub — not wired into the CLI. Its purpose is
-//! to prove the `Strategy` trait works for a strategy with a 1-parameter
-//! sweep that combines a precomputed indicator with a raw price column.
+//! Registered as `price_vs_ema`: a one-parameter sweep combining a precomputed
+//! EMA with the raw close-price column.
 
 use crate::data::Bars;
 use crate::indicators::ma::ema;
@@ -74,7 +73,7 @@ impl Strategy for PriceVsEma {
         }
     }
 
-    fn param_summary(period: Self::Params) -> String {
+    fn param_summary(period: Self::Params, _cfg: &Self::Config) -> String {
         format!("period={period}")
     }
 

@@ -18,6 +18,7 @@
 //! built over the *whole* series and the segment is expressed as a bar range
 //! (see [`run_one_range`]), so the held-out window starts with its warmup
 //! behind it rather than a fresh, invalid one.
+//! Requested splits must leave at least two candles on each side.
 //!
 //! # Cost
 //!
@@ -85,29 +86,30 @@ pub struct SampleSplit {
     pub out_of_sample: Option<std::ops::Range<usize>>,
 }
 
-/// Split `bars` bars at `fraction`. Returns the whole range unsplit when the
-/// fraction is absent, out of range, or would leave either side too short to
-/// backtest (a segment needs at least two bars to produce one return).
-pub fn sample_split(bars: usize, fraction: Option<f32>) -> SampleSplit {
+/// Only an absent fraction disables the holdout. Invalid requests fail closed.
+pub fn sample_split(bars: usize, fraction: Option<f32>) -> anyhow::Result<SampleSplit> {
     const MIN_SEGMENT: usize = 2;
     let whole = SampleSplit {
         in_sample: 0..bars,
         out_of_sample: None,
     };
     let Some(fraction) = fraction else {
-        return whole;
+        return Ok(whole);
     };
-    if !(0.0..=1.0).contains(&fraction) {
-        return whole;
-    }
+    anyhow::ensure!(
+        fraction > 0.0 && fraction < 1.0,
+        "split must be strictly between 0 and 1"
+    );
     let boundary = (bars as f32 * fraction) as usize;
     if boundary < MIN_SEGMENT || bars.saturating_sub(boundary) < MIN_SEGMENT {
-        return whole;
+        anyhow::bail!(
+            "split {fraction} of {bars} candles needs at least {MIN_SEGMENT} candles on each side"
+        );
     }
-    SampleSplit {
+    Ok(SampleSplit {
         in_sample: 0..boundary,
         out_of_sample: Some(boundary..bars),
-    }
+    })
 }
 
 /// Everything one backtest reports. Only `sharpe_ratio` and `final_value` take
@@ -163,6 +165,28 @@ pub struct NumericBacktestConfig<T> {
     pub execution_model: ExecutionModel,
 }
 
+impl<T: BacktestFloat> NumericBacktestConfig<T> {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.starting_capital.is_finite() && self.starting_capital > T::ZERO,
+            "starting capital must be finite and positive"
+        );
+        anyhow::ensure!(
+            self.fee_rate.is_finite() && self.fee_rate >= T::ZERO && self.fee_rate < T::ONE,
+            "fee rate must be finite and in [0, 1)"
+        );
+        anyhow::ensure!(
+            self.risk_free_rate.is_finite(),
+            "risk-free rate must be finite"
+        );
+        anyhow::ensure!(
+            self.periods_per_year > 0,
+            "periods per year must be positive"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SweepResult<P> {
     pub metrics: BacktestMetrics,
@@ -175,8 +199,8 @@ pub struct PrecisionRun<P> {
     /// Winner of the sweep, scored over the optimization segment.
     pub best: SweepResult<P>,
     /// The same parameters re-scored on the held-out tail, when a split was
-    /// requested. This is the number worth trusting; `best` is fitted to its
-    /// own data by construction.
+    /// requested. These bars did not select the winner; `best` is fitted to its
+    /// own data. Repeated tuning against the holdout still overfits it.
     pub out_of_sample: Option<BacktestMetrics>,
     pub duration: Duration,
 }
@@ -260,12 +284,14 @@ fn numeric_backtest_config<T: BacktestFloat>(engine: &EngineConfig) -> NumericBa
 /// Run one backtest for one parameter tuple. Generic over the strategy
 /// (so `S::evaluator` is monomorphized + inlined into the hot loop) and
 /// over the float precision.
+/// Returns errors for invalid configuration, prices or simulated equity.
+/// This lower-level API has no timestamps; use [`run`] for full market validation.
 pub fn run_one<S: Strategy, T: BacktestFloat>(
     bars: Bars<'_, T>,
     cache: &S::Cache<T>,
     params: S::Params,
     cfg: NumericBacktestConfig<T>,
-) -> BacktestMetrics {
+) -> anyhow::Result<BacktestMetrics> {
     run_one_range::<S, T>(bars, cache, params, cfg, 0..bars.len())
 }
 
@@ -281,19 +307,27 @@ pub fn run_one_range<S: Strategy, T: BacktestFloat>(
     params: S::Params,
     cfg: NumericBacktestConfig<T>,
     range: std::ops::Range<usize>,
-) -> BacktestMetrics {
+) -> anyhow::Result<BacktestMetrics> {
     let (open, close) = (bars.open, bars.close);
-    // `run` rejects mismatched inputs up front; the assert keeps that contract
-    // visible here, and the clamp keeps a release build safely truncating
-    // rather than indexing past an end.
-    debug_assert_eq!(open.len(), close.len(), "open/close length mismatch");
-    let limit = open.len().min(close.len());
-    let start = range.start.min(limit);
-    let end = range.end.min(limit);
+    cfg.validate()?;
+    anyhow::ensure!(open.len() == close.len(), "open/close length mismatch");
+    anyhow::ensure!(
+        range.start <= range.end && range.end <= close.len(),
+        "invalid backtest bar range: {range:?}"
+    );
+    let (start, end) = (range.start, range.end);
     let starting_capital = cfg.starting_capital.to_f64();
-    if end.saturating_sub(start) < 2 {
-        return BacktestMetrics::idle(starting_capital);
-    }
+    anyhow::ensure!(
+        end - start >= 2,
+        "a backtest segment needs at least two candles"
+    );
+    anyhow::ensure!(
+        open[start].is_finite()
+            && open[start] > T::ZERO
+            && close[start].is_finite()
+            && close[start] > T::ZERO,
+        "invalid signal candle price at candle {start}"
+    );
 
     let evaluator = S::evaluator::<T>(bars, cache, params);
     let risk_free = cfg.risk_free_rate.to_f64();
@@ -317,6 +351,14 @@ pub fn run_one_range<S: Strategy, T: BacktestFloat>(
     let marks = &close[start + 1..end];
 
     for (offset, (&trade_price, &mark_price)) in trade_prices.iter().zip(marks.iter()).enumerate() {
+        anyhow::ensure!(
+            trade_price.is_finite()
+                && trade_price > T::ZERO
+                && mark_price.is_finite()
+                && mark_price > T::ZERO,
+            "invalid execution/mark price at candle {}",
+            start + offset + 1
+        );
         let signal = evaluator(start + offset);
         match (current, signal) {
             (Position::Flat, Signal::EnterLong) => {
@@ -344,6 +386,12 @@ pub fn run_one_range<S: Strategy, T: BacktestFloat>(
             }
             Position::Flat => usdt,
         };
+        anyhow::ensure!(
+            value.is_finite() && value >= T::ZERO,
+            "invalid portfolio equity at candle {}: {}",
+            start + offset + 1,
+            value.to_f64()
+        );
         stats.push(value.to_f64(), risk_free);
     }
 
@@ -365,7 +413,7 @@ pub fn run_one_range<S: Strategy, T: BacktestFloat>(
         metrics.sharpe_ratio.is_finite(),
         "non-finite sharpe leaked from backtest"
     );
-    metrics
+    Ok(metrics)
 }
 
 fn percentage(part: usize, whole: usize) -> f64 {
@@ -382,14 +430,15 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
     bars: Bars<'_, T>,
     parameter_set: &[S::Params],
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
+    let backtest_config = numeric_backtest_config::<T>(engine);
+    backtest_config.validate()?;
+    let split = sample_split(bars.len(), engine.split)?;
     report(
         engine,
         format_args!("Calculating all indicators for {ACTIVE_PRECISION}..."),
     );
     let cache = S::build_cache::<T>(bars, strategy_config)
         .with_context(|| format!("strategy '{}' could not build its indicators", S::NAME))?;
-    let backtest_config = numeric_backtest_config::<T>(engine);
-    let split = sample_split(bars.len(), engine.split);
 
     report(
         engine,
@@ -419,7 +468,7 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
         .install(|| {
             parameter_set
                 .par_iter()
-                .fold(
+                .try_fold(
                     || None::<SweepResult<S::Params>>,
                     |acc, &params| {
                         let metrics = run_one_range::<S, T>(
@@ -428,7 +477,7 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                             params,
                             backtest_config,
                             split.in_sample.clone(),
-                        );
+                        )?;
 
                         let count = progress_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                         if engine.show_progress
@@ -443,21 +492,23 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
                         }
 
                         let candidate = SweepResult { metrics, params };
-                        Some(match acc {
+                        Ok::<_, anyhow::Error>(Some(match acc {
                             Some(prev) => prefer::<S>(prev, candidate),
                             None => candidate,
+                        }))
+                    },
+                )
+                .try_reduce(
+                    || None::<SweepResult<S::Params>>,
+                    |a, b| {
+                        Ok(match (a, b) {
+                            (Some(x), Some(y)) => Some(prefer::<S>(x, y)),
+                            (Some(x), None) | (None, Some(x)) => Some(x),
+                            (None, None) => None,
                         })
                     },
                 )
-                .reduce(
-                    || None::<SweepResult<S::Params>>,
-                    |a, b| match (a, b) {
-                        (Some(x), Some(y)) => Some(prefer::<S>(x, y)),
-                        (Some(x), None) | (None, Some(x)) => Some(x),
-                        (None, None) => None,
-                    },
-                )
-        })
+        })?
         .with_context(|| format!("strategy '{}' produced an empty parameter sweep", S::NAME))?;
     let duration = start.elapsed();
 
@@ -465,7 +516,8 @@ fn run_precision_sweep_impl<S: Strategy, T: BacktestFloat>(
     // sweep, so it stays out of the measured duration.
     let out_of_sample = split
         .out_of_sample
-        .map(|range| run_one_range::<S, T>(bars, &cache, best.params, backtest_config, range));
+        .map(|range| run_one_range::<S, T>(bars, &cache, best.params, backtest_config, range))
+        .transpose()?;
 
     Ok(PrecisionRun {
         precision: ACTIVE_PRECISION,
@@ -483,32 +535,14 @@ fn report(engine: &EngineConfig, message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Validate OHLCV, uninterrupted cadence and configuration, then sweep.
+/// Data repair belongs to the downloader; this entry point never uses the network.
 pub fn run<S: Strategy>(
     engine: &EngineConfig,
     strategy_config: &S::Config,
     market: &CandleSeries,
 ) -> anyhow::Result<PrecisionRun<S::Params>> {
-    // A ragged series means the loader or the caller is broken. Failing here
-    // is the whole point: silently backtesting the shorter prefix would return
-    // a plausible-looking result for data that does not exist.
-    if !market.is_rectangular() {
-        anyhow::bail!(
-            "malformed market data: columns disagree in length \
-             (timestamps={}, open={}, high={}, low={}, close={}, volume={})",
-            market.timestamps.len(),
-            market.open_prices.len(),
-            market.high_prices.len(),
-            market.low_prices.len(),
-            market.close_prices.len(),
-            market.volumes.len(),
-        );
-    }
-    if market.len() < 2 {
-        anyhow::bail!(
-            "not enough candles to backtest: {} (need at least 2)",
-            market.len()
-        );
-    }
+    market.validate(engine.level)?;
 
     let pool = ThreadPoolBuilder::new()
         .num_threads(engine.threads)
@@ -572,7 +606,7 @@ mod tests {
             move |i| cache.get(i).copied().unwrap_or(Signal::Hold)
         }
 
-        fn param_summary(_: ()) -> String {
+        fn param_summary(_: (), _: &Self::Config) -> String {
             String::new()
         }
 
@@ -605,7 +639,8 @@ mod tests {
             &cache,
             (1, 2),
             num_cfg::<f32>(1000.0),
-        );
+        )
+        .unwrap();
 
         assert!((metrics.final_value - 499.25).abs() < 1e-3);
     }
@@ -624,7 +659,8 @@ mod tests {
             &cache,
             (1, 2),
             num_cfg::<f32>(1000.0),
-        );
+        )
+        .unwrap();
 
         let expected = 1000.0_f64 * (1.0 - 0.0015_f64).powi(2);
         assert!(
@@ -649,7 +685,8 @@ mod tests {
             &cache,
             (1, 2),
             num_cfg::<f64>(1000.0),
-        );
+        )
+        .unwrap();
 
         assert!((metrics.final_value - 499.25).abs() < 1e-6);
     }
@@ -669,7 +706,8 @@ mod tests {
         let prices = bars_of(open_prices, close_prices);
 
         let metrics =
-            run_one::<SignalScript, f32>(prices.bars(), &cache, (), num_cfg::<f32>(1000.0));
+            run_one::<SignalScript, f32>(prices.bars(), &cache, (), num_cfg::<f32>(1000.0))
+                .unwrap();
 
         assert!(
             (metrics.final_value - 499.25).abs() < 1e-3,
@@ -718,15 +756,16 @@ mod tests {
 
     #[test]
     fn sample_split_divides_the_bar_range() {
-        let split = sample_split(100, Some(0.7));
+        let split = sample_split(100, Some(0.7)).unwrap();
         assert_eq!(split.in_sample, 0..70);
         assert_eq!(split.out_of_sample, Some(70..100));
     }
 
     #[test]
-    fn sample_split_falls_back_to_the_whole_range_when_a_side_would_be_too_short() {
+    fn sample_split_rejects_invalid_holdouts() {
+        assert_eq!(sample_split(100, None).unwrap().in_sample, 0..100);
         for (bars, fraction) in [
-            (100, None),
+            (100, Some(f32::NAN)),
             (100, Some(0.0)),
             (100, Some(1.0)),
             (100, Some(1.5)),  // out of range
@@ -735,17 +774,45 @@ mod tests {
             (100, Some(0.99)), // out-of-sample would be 1 bar
             (3, Some(0.5)),    // too few bars to divide at all
         ] {
-            let split = sample_split(bars, fraction);
-            assert_eq!(
-                split.in_sample,
-                0..bars,
-                "bars={bars} fraction={fraction:?}"
-            );
-            assert_eq!(
-                split.out_of_sample, None,
+            assert!(
+                sample_split(bars, fraction).is_err(),
                 "bars={bars} fraction={fraction:?}"
             );
         }
+    }
+
+    #[test]
+    fn execution_rejects_invalid_prices_config_and_overflow() {
+        let signals = vec![Signal::EnterLong; 3];
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let prices = bars_of(vec![100.0_f32, bad, 100.0], vec![100.0; 3]);
+            assert!(
+                run_one::<SignalScript, f32>(prices.bars(), &signals, (), num_cfg(1000.0)).is_err()
+            );
+        }
+        let prices = bars_of(vec![100.0_f32; 3], vec![100.0; 3]);
+        for capital in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                run_one::<SignalScript, f32>(prices.bars(), &signals, (), num_cfg(capital))
+                    .is_err()
+            );
+        }
+        for fee in [-0.1, 1.0, f32::NAN, f32::INFINITY] {
+            let cfg = NumericBacktestConfig {
+                fee_rate: fee,
+                ..num_cfg(1000.0)
+            };
+            assert!(run_one::<SignalScript, f32>(prices.bars(), &signals, (), cfg).is_err());
+        }
+        let cfg = NumericBacktestConfig {
+            risk_free_rate: f32::NAN,
+            ..num_cfg(1000.0)
+        };
+        assert!(run_one::<SignalScript, f32>(prices.bars(), &signals, (), cfg).is_err());
+        let prices = bars_of(vec![1.0_f32, f32::MIN_POSITIVE, 1.0], vec![1.0; 3]);
+        assert!(
+            run_one::<SignalScript, f32>(prices.bars(), &signals, (), num_cfg(1000.0)).is_err()
+        );
     }
 
     #[test]
@@ -764,14 +831,16 @@ mod tests {
             (),
             num_cfg::<f32>(1000.0),
             0..10,
-        );
+        )
+        .unwrap();
         let second = run_one_range::<SignalScript, f32>(
             prices.bars(),
             &always_long,
             (),
             num_cfg::<f32>(1000.0),
             10..20,
-        );
+        )
+        .unwrap();
 
         assert!(
             (first.final_value - 998.5).abs() < 1e-2,
@@ -806,7 +875,8 @@ mod tests {
             (),
             num_cfg::<f32>(1000.0),
             0..close.len(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(m.trades, 2, "two completed round trips");
         assert!((m.win_rate - 50.0).abs() < 1e-6, "one up, one down");
@@ -826,7 +896,8 @@ mod tests {
             (),
             num_cfg::<f32>(1000.0),
             0..close.len(),
-        );
+        )
+        .unwrap();
         assert_eq!(m.trades, 0, "never exited, so nothing completed");
         assert_eq!(m.win_rate, 0.0);
         assert!(m.final_value > 1000.0, "but the equity still marked up");

@@ -13,7 +13,7 @@
 //! surface is a dozen flags, and the dependency list is deliberately short.
 
 use anyhow::Context as _;
-use backtest_rust::backtest::{BacktestMetrics, EngineConfig, ExecutionModel};
+use backtest_rust::backtest::{sample_split, BacktestMetrics, EngineConfig, ExecutionModel};
 use backtest_rust::data::{load_data_file, DataPaths};
 use backtest_rust::download::download_dump_k_lines;
 use backtest_rust::exchange::Level;
@@ -133,11 +133,12 @@ fn parse_since_value(value: &str) -> anyhow::Result<u64> {
     let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").with_context(|| {
         format!("invalid --since '{value}'; expected YYYY-MM-DD or unix-milliseconds")
     })?;
-    Ok(date
+    let millis = date
         .and_hms_opt(0, 0, 0)
         .unwrap()
         .and_utc()
-        .timestamp_millis() as u64)
+        .timestamp_millis();
+    u64::try_from(millis).context("--since must not precede the unix epoch")
 }
 
 fn parse_cli_args<I, S>(args: I) -> anyhow::Result<CliOpts>
@@ -245,8 +246,8 @@ fn parse_split_value(value: &str) -> anyhow::Result<f32> {
         .trim()
         .parse()
         .with_context(|| format!("invalid --split '{value}'; expected a fraction like 0.7"))?;
-    if !(0.0..=1.0).contains(&fraction) {
-        anyhow::bail!("invalid --split '{value}'; must be between 0 and 1");
+    if !(fraction > 0.0 && fraction < 1.0) {
+        anyhow::bail!("invalid --split '{value}'; must be strictly between 0 and 1");
     }
     Ok(fraction)
 }
@@ -290,7 +291,7 @@ fn usage_text() -> String {
            --level <INTERVAL>    Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)\n  \
            --threads <N>         Rayon worker threads; 0 = auto (default: 1)\n  \
            --force               Bypass the freshness guard and re-download\n  \
-           --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)\n  \
+           --since <DATE|MS>     Download and backtest from this date (YYYY-MM-DD or unix-ms)\n  \
            --split <FRACTION>    Optimize on the leading FRACTION of candles and\n                         \
                                  report the winner on the held-out remainder\n  \
            --data-dir <PATH>     Kline cache directory (default: dataKLines)\n  \
@@ -382,44 +383,33 @@ async fn main() -> anyhow::Result<()> {
     let paths = cli.data_paths();
     let data_file = paths.feather(&engine.pair, &engine.level);
 
-    let download_result = download_dump_k_lines(
+    download_dump_k_lines(
         &paths,
         &engine.pair,
         engine.level,
         engine.download_start..,
         force,
     )
-    .await;
+    .await
+    .with_context(|| {
+        format!(
+            "failed to obtain market data for {} {}",
+            engine.pair, engine.level
+        )
+    })?;
 
     if cli.mode == RunMode::DownloadOnly {
-        download_result.with_context(|| {
-            format!(
-                "failed to download market data for {} {}",
-                engine.pair, engine.level
-            )
-        })?;
         println!("Download complete: {}", data_file.display());
         println!("Time elapsed: {:?}", start.elapsed());
         return Ok(());
     }
 
-    if let Err(error) = download_result {
-        if !data_file.is_file() {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to download market data and no cached file is available at {}",
-                    data_file.display()
-                )
-            });
-        }
-        eprintln!(
-            "Download failed ({error:#}). Falling back to cached data at {}.",
-            data_file.display()
-        );
-    }
-
     println!("Doing: {} {}", engine.pair, engine.level);
-    let market = load_data_file(&paths, &engine.pair, &engine.level)?;
+    let mut market = load_data_file(&paths, &engine.pair, &engine.level)?;
+    if let Some(since) = cli.since {
+        market.retain_since(since)?;
+    }
+    let split = sample_split(market.len(), engine.split)?;
     print_boundary_timestamp("First", market.timestamps.first().copied());
     print_boundary_timestamp("Last ", market.timestamps.last().copied());
 
@@ -439,10 +429,7 @@ async fn main() -> anyhow::Result<()> {
     );
     if let Some(out_of_sample) = &report.out_of_sample {
         print_metrics("Out-of-sample", out_of_sample);
-        println!(
-            "  (the out-of-sample row is the honest one; the in-sample row is \
-             fitted to its own data)"
-        );
+        println!("  (held-out bars were not used to select the winning parameters)");
     }
     println!("Sweep duration: {:.3}s", report.duration.as_secs_f64());
 
@@ -456,6 +443,16 @@ async fn main() -> anyhow::Result<()> {
             strategy: report.name,
             params: &report.params,
             duration_ms: report.duration.as_secs_f64() * 1000.0,
+            first_time_ms: market.timestamps[0],
+            last_time_ms: *market.timestamps.last().unwrap(),
+            candles: market.len(),
+            requested_start_ms: cli.since,
+            split_fraction: engine.split,
+            split_index: split.out_of_sample.map(|range| range.start),
+            starting_capital: engine.starting_capital,
+            fee_rate: engine.fee_rate,
+            risk_free_rate: engine.risk_free_rate,
+            execution_model: engine.execution_model,
             metrics: report.metrics,
             out_of_sample: report.out_of_sample,
         },
@@ -633,6 +630,9 @@ mod tests {
 
     #[test]
     fn parse_split_value_rejects_values_outside_zero_to_one() {
+        for value in ["0", "1", "NaN", "inf"] {
+            assert!(parse_split_value(value).is_err());
+        }
         assert!(parse_split_value("1.5").is_err());
         assert!(parse_split_value("-0.2").is_err());
         assert!(parse_split_value("half").is_err());

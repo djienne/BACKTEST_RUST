@@ -6,6 +6,9 @@
 //! and scaled to the timeframe: a cache is stale once a newer bar has
 //! certainly closed. A flat wall-clock threshold would let a 15m backtest run
 //! on data hundreds of candles old.
+//! Fresh caches are still scanned for gaps. Missing prefixes, stale tails and
+//! internal gaps are fetched through the same provider; unresolved requested
+//! intervals return an error after successful gap repairs have been saved.
 //!
 //! # Merging
 //!
@@ -19,7 +22,9 @@
 //! the still-forming candle is dropped before it ever reaches the merge.
 
 use crate::data::DataPaths;
-use crate::exchange::{get_k_range, Binance, KlineProvider, Level, TimeRange, K};
+use crate::exchange::{
+    get_k_range, missing_candle_ranges, Binance, KlineProvider, Level, TimeRange, K,
+};
 use crate::feather;
 use anyhow::{Context, Result};
 use std::fs;
@@ -124,46 +129,6 @@ pub fn normalize_klines(v: &mut Vec<K>) -> NormalizeReport {
     }
 }
 
-fn ensure_strictly_increasing_and_unique(v: &[K]) -> Result<()> {
-    if v.len() <= 1 {
-        return Ok(());
-    }
-
-    for i in 1..v.len() {
-        if v[i].time <= v[i - 1].time {
-            anyhow::bail!(
-                "candles must have strictly increasing unique timestamps: {} followed by {}",
-                v[i - 1].time,
-                v[i].time
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn interval_check(v: &[K]) -> (bool, u64) {
-    if v.len() <= 1 {
-        return (true, 0);
-    }
-
-    let expected_interval = v[1].time.wrapping_sub(v[0].time);
-    let mut max_gap = expected_interval;
-    let mut is_constant = true;
-
-    for i in 1..v.len() {
-        let interval = v[i].time.wrapping_sub(v[i - 1].time);
-        if interval != expected_interval {
-            if interval > max_gap {
-                max_gap = interval;
-            }
-            is_constant = false;
-        }
-    }
-
-    (is_constant, max_gap)
-}
-
 /// One-time conversion of a JSON kline cache into the new Feather format.
 /// Reads the JSON, runs the same normalization the loader applies, writes the
 /// Feather file, then removes the JSON. Idempotent: if the target Feather
@@ -214,6 +179,8 @@ pub fn migrate_legacy_json(legacy: &Path, target: &Path) -> Result<()> {
 }
 
 /// Refresh the on-disk cache for `(product, level)` from Binance.
+/// Failed required downloads and unresolved gaps are errors, not permission to
+/// backtest stale or incomplete data. `force` replaces the cache from `range`.
 pub async fn download_dump_k_lines<T>(
     paths: &DataPaths,
     product: &str,
@@ -258,90 +225,60 @@ where
         })?;
     }
 
-    let cache_exists = cache_path.exists() && cache_path.is_file();
     let now_ms = now_unix_millis()?;
     let range: TimeRange = range.into();
-
-    // Decide between: skip (fresh), incremental (stale + cache present),
-    // full download (force, no cache, or cache empty/unreadable).
-    let mut existing: Option<Vec<K>> = None;
-    let download_range: TimeRange = if force || !cache_exists {
-        if force {
-            println!("Force-download requested for {:?}.", cache_path);
-        } else {
-            println!(
-                "Downloading {:?} because file does not exist...",
-                cache_path
-            );
-        }
-        range
+    anyhow::ensure!(
+        range.end.is_none_or(|end| end >= range.start),
+        "download range ends before it starts"
+    );
+    let mut merged = if force || !cache_path.is_file() {
+        Vec::new()
     } else {
-        match feather::read_last_time(&cache_path) {
-            Ok(last_ms) => {
-                let age_ms = now_ms.saturating_sub(last_ms);
-                if is_cache_fresh(last_ms, now_ms, cache_max_age_ms(level)) {
-                    println!(
-                        "File {:?} is up to date (last candle ~{}h old). Skip Download.",
-                        cache_path,
-                        age_ms / 3_600_000
-                    );
-                    return Ok(());
-                }
-                match feather::read(&cache_path) {
-                    Ok(prev) => {
-                        println!(
-                            "File {:?} last candle is ~{}h old; fetching delta from {last_ms} onward...",
-                            cache_path,
-                            age_ms / 3_600_000,
-                        );
-                        existing = Some(prev);
-                        // Deliberately restart *at* the newest cached candle
-                        // rather than one millisecond past it: older versions
-                        // of this program stored the still-forming candle, and
-                        // re-reading it lets `normalize_klines` replace that
-                        // stale copy with the finished one.
-                        TimeRange {
-                            start: last_ms,
-                            end: range.end,
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "Could not read existing cache {} ({error:#}); falling back to full re-download.",
-                            cache_path.display()
-                        );
-                        range
-                    }
-                }
-            }
+        match feather::read(&cache_path) {
+            Ok(prev) => prev,
             Err(error) => {
                 eprintln!(
-                    "Could not read cache freshness for {} ({error:#}); falling back to full re-download.",
+                    "Could not read cache {} ({error:#}); falling back to full re-download.",
                     cache_path.display()
                 );
-                range
+                Vec::new()
             }
         }
     };
-
-    let mut new_batch = get_k_range(provider, product, level, download_range)
-        .await
-        .with_context(|| format!("Failed to download candlesticks for {product} {level}"))?;
-    new_batch.reverse();
-    println!("Fetched {} new candle(s).", new_batch.len());
-
-    let mut merged = match existing {
-        Some(mut prev) => {
-            prev.extend(new_batch);
-            prev
+    let mut changed = normalize_klines(&mut merged).changed();
+    let mut downloads = Vec::new();
+    if let (Some(first), Some(last)) = (merged.first(), merged.last()) {
+        if range.start < first.time {
+            downloads.push(TimeRange {
+                start: range.start,
+                end: Some(range.end.unwrap_or(first.time - 1).min(first.time - 1)),
+            });
         }
-        None => new_batch,
-    };
-
-    // Normalize first (sort + dedup) so any overlap or out-of-order rows from
-    // the fresh API page are absorbed before the strict sanity checks run.
-    let _ = normalize_klines(&mut merged);
-
+        if !is_cache_fresh(last.time, now_ms, cache_max_age_ms(level))
+            && range.end.is_none_or(|end| end >= last.time)
+        {
+            // Re-read the last cached candle to repair older, unfinished copies.
+            downloads.push(TimeRange {
+                start: last.time,
+                end: range.end,
+            });
+        }
+    } else {
+        downloads.push(range);
+    }
+    for window in downloads {
+        let batch = get_k_range(provider, product, level, window)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to download {product} {level} from {} to {:?}",
+                    window.start, window.end
+                )
+            })?;
+        changed |= !batch.is_empty();
+        merged.extend(batch);
+    }
+    normalize_klines(&mut merged);
     if merged.is_empty() {
         anyhow::bail!(
             "Refusing to write an empty cache file at {}",
@@ -349,21 +286,40 @@ where
         );
     }
 
-    ensure_strictly_increasing_and_unique(&merged)
-        .context("post-merge sanity check failed: merged candles are not strictly increasing")?;
-
-    let (is_constant, max_gap) = interval_check(&merged);
-    if !is_constant {
+    // Freshness says nothing about internal gaps. Make one bounded repair pass;
+    // the provider already retries transient HTTP failures.
+    for gap in missing_candle_ranges(merged.iter().map(|k| k.time), level)? {
         println!(
-            "Warning: merged candles have non-uniform spacing — max gap: {} hours",
-            max_gap / 3_600_000
+            "Repairing {product} {level} gap {}..={} unix-ms",
+            gap.start,
+            gap.end.unwrap()
+        );
+        match get_k_range(provider, product, level, gap).await {
+            Ok(batch) => {
+                changed |= !batch.is_empty();
+                merged.extend(batch);
+            }
+            Err(error) => eprintln!("Gap repair failed: {error:#}"),
+        }
+    }
+    normalize_klines(&mut merged);
+    // Preserve successful repairs even when other intervals remain unavailable.
+    if changed {
+        feather::write(&cache_path, &merged).with_context(|| {
+            format!("Failed to write market data file: {}", cache_path.display())
+        })?;
+    }
+    let remaining = missing_candle_ranges(merged.iter().map(|k| k.time), level)?;
+    if let Some(gap) = remaining
+        .iter()
+        .find(|gap| gap.end.unwrap() >= range.start && range.end.is_none_or(|end| gap.start <= end))
+    {
+        anyhow::bail!(
+            "unresolved {product} {level} candle gap after repair: {}..={} unix-ms",
+            gap.start,
+            gap.end.unwrap()
         );
     }
-
-    println!("Done.");
-    feather::write(&cache_path, &merged)
-        .with_context(|| format!("Failed to write market data file: {}", cache_path.display()))?;
-
     Ok(())
 }
 
@@ -427,12 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_validator_returns_structured_errors() {
-        let candles = small_klines(&[2, 1]);
-        assert!(ensure_strictly_increasing_and_unique(&candles).is_err());
-    }
-
-    #[test]
     fn normalize_klines_sorts_and_dedups() {
         let mut v = vec![
             K::flat(3, 1.0),
@@ -482,48 +432,6 @@ mod tests {
             removed_duplicates: 1
         }
         .changed());
-    }
-
-    #[test]
-    fn ensure_strictly_increasing_accepts_sorted_unique() {
-        let v = small_klines(&[1, 2, 3]);
-        assert!(ensure_strictly_increasing_and_unique(&v).is_ok());
-    }
-
-    #[test]
-    fn ensure_strictly_increasing_rejects_equal_timestamps() {
-        let v = small_klines(&[1, 1]);
-        assert!(ensure_strictly_increasing_and_unique(&v).is_err());
-    }
-
-    #[test]
-    fn ensure_strictly_increasing_accepts_empty_and_single() {
-        assert!(ensure_strictly_increasing_and_unique(&[]).is_ok());
-        let v = small_klines(&[42]);
-        assert!(ensure_strictly_increasing_and_unique(&v).is_ok());
-    }
-
-    #[test]
-    fn interval_check_detects_constant_cadence() {
-        let v = small_klines(&[0, 100, 200]);
-        let (is_constant, max_gap) = interval_check(&v);
-        assert!(is_constant);
-        assert_eq!(max_gap, 100);
-    }
-
-    #[test]
-    fn interval_check_reports_largest_gap() {
-        let v = small_klines(&[0, 100, 500, 600]);
-        let (is_constant, max_gap) = interval_check(&v);
-        assert!(!is_constant);
-        assert_eq!(max_gap, 400);
-    }
-
-    #[test]
-    fn interval_check_handles_short_input() {
-        assert_eq!(interval_check(&[]), (true, 0));
-        let v = small_klines(&[42]);
-        assert_eq!(interval_check(&v), (true, 0));
     }
 
     #[test]
@@ -708,6 +616,111 @@ mod tests {
         served: std::sync::atomic::AtomicBool,
     }
 
+    struct HistoryProvider {
+        rows: Vec<K>,
+        calls: std::sync::Mutex<Vec<u64>>,
+        fail: bool,
+    }
+
+    impl KlineProvider for HistoryProvider {
+        #[allow(clippy::manual_async_fn)] // Match the trait's self-borrowed future lifetime.
+        fn get_k(
+            &self,
+            _: &str,
+            _: Level,
+            time: u64,
+        ) -> impl std::future::Future<Output = Result<Vec<K>>> + Send + '_ {
+            async move {
+                self.calls.lock().unwrap().push(time);
+                anyhow::ensure!(!self.fail, "simulated download failure");
+                Ok(self
+                    .rows
+                    .iter()
+                    .rev()
+                    .filter(|k| k.time <= time)
+                    .copied()
+                    .collect())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_repairs_internal_gaps_and_preserves_partial_repairs() {
+        let last = (now_unix_millis().unwrap() / 60_000 - 1) * 60_000;
+        let rows = small_klines(&(0..5).map(|i| last - (4 - i) * 60_000).collect::<Vec<_>>());
+        let cached = vec![rows[0], rows[2], rows[4]];
+        for (label, available, fail) in [
+            ("complete", rows.clone(), false),
+            ("partial", vec![rows[0], rows[1], rows[2], rows[4]], false),
+            ("failed", rows.clone(), true),
+        ] {
+            let temp = TempPaths::new(label);
+            let path = temp.paths.feather("ANY-USDT", &Level::Minute1);
+            feather::write(&path, &cached).unwrap();
+            let provider = HistoryProvider {
+                rows: available,
+                calls: Default::default(),
+                fail,
+            };
+            let result = download_with_provider(
+                &provider,
+                &temp.paths,
+                "ANY-USDT",
+                Level::Minute1,
+                rows[0].time..,
+                false,
+            )
+            .await;
+            let restored = feather::read(&path).unwrap();
+            assert_eq!(
+                *provider.calls.lock().unwrap(),
+                vec![rows[2].time - 1, rows[4].time - 1]
+            );
+            if label == "complete" {
+                result.unwrap();
+                assert_eq!(restored, rows);
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains("unresolved"));
+                assert_eq!(restored.len(), if fail { 3 } else { 4 });
+                assert_eq!(restored.first(), cached.first());
+                assert_eq!(restored.last(), cached.last());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_backfills_earlier_start_and_never_hides_fetch_failure() {
+        let last = (now_unix_millis().unwrap() / 60_000 - 1) * 60_000;
+        let rows = small_klines(&(0..5).map(|i| last - (4 - i) * 60_000).collect::<Vec<_>>());
+        for fail in [false, true] {
+            let temp = TempPaths::new("prefix");
+            let path = temp.paths.feather("ANY-USDT", &Level::Minute1);
+            feather::write(&path, &rows[3..]).unwrap();
+            let provider = HistoryProvider {
+                rows: rows.clone(),
+                calls: Default::default(),
+                fail,
+            };
+            let result = download_with_provider(
+                &provider,
+                &temp.paths,
+                "ANY-USDT",
+                Level::Minute1,
+                rows[0].time..,
+                false,
+            )
+            .await;
+            assert_eq!(provider.calls.lock().unwrap()[0], rows[3].time - 1);
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(feather::read(&path).unwrap(), rows[3..]);
+            } else {
+                result.unwrap();
+                assert_eq!(feather::read(&path).unwrap(), rows);
+            }
+        }
+    }
+
     impl OnePageProvider {
         fn new(page: Vec<K>) -> Self {
             Self {
@@ -756,9 +769,16 @@ mod tests {
             K::flat(newest_open, 999.0),
         ]);
 
-        download_with_provider(&provider, &temp.paths, "ANY-USDT", level, 0u64.., false)
-            .await
-            .expect("incremental download succeeds");
+        download_with_provider(
+            &provider,
+            &temp.paths,
+            "ANY-USDT",
+            level,
+            older_open..,
+            false,
+        )
+        .await
+        .expect("incremental download succeeds");
 
         let merged = feather::read(&temp.paths.feather("ANY-USDT", &level)).unwrap();
         assert_eq!(merged.len(), 3, "one bar appended, none duplicated");

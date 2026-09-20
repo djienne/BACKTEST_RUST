@@ -7,8 +7,8 @@
 //! # Pagination
 //!
 //! Binance's `/klines` endpoint is queried backwards from an inclusive
-//! `endTime`, one 1500-candle page at a time, until a page reaches past the
-//! requested start. Each page advances the cursor one millisecond past its
+//! `endTime`, using server-sized pages until a page reaches past the
+//! requested start. Each page advances the cursor one millisecond before its
 //! oldest candle, because `endTime` is inclusive and would otherwise refetch
 //! it forever.
 //!
@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const INTER_PAGE_DELAY_MS: u64 = 50;
 const BINANCE_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
-/// A 1500-candle page over a slow link needs more than the 5s this used to use.
+/// Allow slow public API responses without an excessively short timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RETRIES: u32 = 4;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
@@ -118,7 +118,7 @@ impl Level {
 
 /// Close time of the candle that opens at `open_ms` — i.e. the open time of the
 /// following candle. `None` when the timestamp is not representable as a date,
-/// which callers must treat as "unknown", never as "closed".
+/// which means its closure cannot be determined from this calculation.
 pub fn candle_close_time_ms(level: Level, open_ms: u64) -> Option<u64> {
     match level.fixed_duration_ms() {
         Some(duration) => open_ms.checked_add(duration),
@@ -189,8 +189,8 @@ pub struct K {
     pub low: f32,
     pub close: f32,
     /// Base-asset volume. `NaN` means "this cache predates volume support",
-    /// which is distinguishable from a genuine zero-volume bar; it backfills
-    /// on the next download.
+    /// which is distinguishable from a genuine zero-volume bar. Incremental
+    /// refreshes replace only fetched rows; `--force` rebuilds all volumes.
     #[serde(default = "unknown_volume")]
     pub volume: f32,
 }
@@ -258,6 +258,49 @@ impl From<RangeFull> for TimeRange {
             end: None,
         }
     }
+}
+
+/// Missing candle-open intervals, with inclusive bounds suitable for fetching.
+/// Reject malformed cadence rather than interpreting it as ordinary missing data.
+pub fn missing_candle_ranges(
+    times: impl IntoIterator<Item = u64>,
+    level: Level,
+) -> Result<Vec<TimeRange>> {
+    let mut times = times.into_iter();
+    let Some(mut previous) = times.next() else {
+        return Ok(Vec::new());
+    };
+    let mut gaps = Vec::new();
+    for time in times {
+        let expected = candle_close_time_ms(level, previous)
+            .with_context(|| format!("invalid {level} candle timestamp: {previous}"))?;
+        anyhow::ensure!(
+            time >= expected,
+            "invalid {level} cadence: {previous} followed by {time}; expected {expected}"
+        );
+        if time > expected {
+            let aligned = if let Some(duration) = level.fixed_duration_ms() {
+                (time - expected).is_multiple_of(duration)
+            } else {
+                let mut next = expected;
+                while next < time {
+                    next = candle_close_time_ms(level, next)
+                        .context("invalid monthly candle timestamp")?;
+                }
+                next == time
+            };
+            anyhow::ensure!(
+                aligned,
+                "timestamp {time} is off the {level} cadence after {previous}"
+            );
+            gaps.push(TimeRange {
+                start: expected,
+                end: Some(time - 1),
+            });
+        }
+        previous = time;
+    }
+    Ok(gaps)
 }
 
 /// Source of kline data. Abstracts over the live Binance HTTP client and
@@ -559,6 +602,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cadence_reports_gaps_and_rejects_malformed_timestamps() {
+        assert!(missing_candle_ranges([0, 60_000, 120_000], Level::Minute1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            missing_candle_ranges([0, 60_000, 240_000], Level::Minute1).unwrap(),
+            vec![TimeRange {
+                start: 120_000,
+                end: Some(239_999)
+            }]
+        );
+        for times in [[60_000, 0], [60_000, 60_000], [0, 90_000], [0, 1]] {
+            assert!(missing_candle_ranges(times, Level::Minute1).is_err());
+        }
+        let month = |m| {
+            Utc.with_ymd_and_hms(2024, m, 1, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+        assert!(
+            missing_candle_ranges([month(1), month(2), month(3)], Level::Month1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            missing_candle_ranges([month(1), month(3)], Level::Month1).unwrap(),
+            vec![TimeRange {
+                start: month(2),
+                end: Some(month(3) - 1)
+            }]
+        );
+    }
 
     #[test]
     fn level_display_matches_binance_intervals() {

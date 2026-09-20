@@ -83,20 +83,17 @@ impl BarsF64 {
     }
 }
 
-/// Index of the first non-`NaN` value, or `None` if there is none.
+/// Index of the first finite value, or `None` if there is none.
 pub fn first_valid(values: &[f64]) -> Option<usize> {
     values.iter().position(|v| v.is_finite())
 }
 
-/// The finite tail of a `NaN`-prefixed series, with the offset it starts at.
+/// The tail starting at the first finite value, with its offset.
 ///
-/// Every indicator here begins by calling this, which is what makes them
-/// composable: HMA is a WMA of a difference of WMAs, StochRSI is a stochastic
-/// of an RSI, a MACD signal line is an EMA of a MACD line. Without it each
-/// stage would see its input's warmup as data and propagate `NaN` forever.
+/// Moving averages and rolling statistics use this to skip an input's warmup,
+/// allowing composition such as HMA, StochRSI and MACD signal lines.
 ///
-/// The assumption is that a series is `NaN` up to some index and finite after
-/// it — true of every indicator in this module.
+/// This does not validate or repair missing values inside the returned tail.
 pub fn valid_tail(values: &[f64]) -> Option<(usize, &[f64])> {
     first_valid(values).map(|start| (start, &values[start..]))
 }

@@ -1,6 +1,6 @@
 //! Two-EMA crossover strategy: long when fast EMA > slow EMA, flat otherwise.
 //!
-//! Indicator values become valid one bar after each EMA's period; before
+//! Each EMA becomes valid at index `period - 1` of finite input; before
 //! that, the EMA is `NaN` and every comparison against `NaN` is false, so the
 //! evaluator naturally emits `Hold` during warmup without an explicit guard.
 
@@ -81,7 +81,7 @@ impl Strategy for DoubleEmaCrossover {
         }
     }
 
-    fn param_summary((fast, slow): Self::Params) -> String {
+    fn param_summary((fast, slow): Self::Params, _cfg: &Self::Config) -> String {
         format!("fast={fast},slow={slow}")
     }
 

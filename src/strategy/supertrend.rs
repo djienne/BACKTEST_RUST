@@ -101,7 +101,7 @@ impl Strategy for SupertrendFollow {
         }
     }
 
-    fn param_summary((_, period, tenths): Self::Params) -> String {
+    fn param_summary((_, period, tenths): Self::Params, _cfg: &Self::Config) -> String {
         format!("period={period},multiplier={:.1}", tenths as f64 / 10.0)
     }
 

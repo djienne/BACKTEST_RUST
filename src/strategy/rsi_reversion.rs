@@ -90,7 +90,7 @@ impl Strategy for RsiReversion {
         }
     }
 
-    fn param_summary((period, oversold, overbought): Self::Params) -> String {
+    fn param_summary((period, oversold, overbought): Self::Params, _cfg: &Self::Config) -> String {
         format!("period={period},oversold={oversold},overbought={overbought}")
     }
 

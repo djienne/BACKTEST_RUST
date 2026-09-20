@@ -15,14 +15,14 @@
 //! directories and the CLI offer `--data-dir` / `--results-dir`.
 
 use crate::download::load_k_lines;
-use crate::exchange::Level;
+use crate::exchange::{missing_candle_ranges, Level};
 use crate::precision::BacktestFloat;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Loaded market data, one `Vec` per column. Stored as `f32` because that is
-/// the precision the exchange quotes and the cache stores; widening happens
-/// once per run in [`MarketArrays`], not per candle.
+/// Loaded market data, one `Vec` per column, matching the cache's `f32`
+/// storage. Widening in [`MarketArrays`] does not recover the decimal precision
+/// lost when exchange price strings were parsed into `f32`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandleSeries {
     pub timestamps: Vec<u64>,
@@ -54,6 +54,58 @@ impl CandleSeries {
             && self.high_prices.len() == n
             && self.low_prices.len() == n
             && self.volumes.len() == n
+    }
+
+    /// Keep candles opening at or after `since` without truncating the cache.
+    /// Requires sorted timestamps, as produced by the loader.
+    pub fn retain_since(&mut self, since: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.is_rectangular(),
+            "malformed market data: columns disagree in length"
+        );
+        let start = self.timestamps.partition_point(|&time| time < since);
+        self.timestamps.drain(..start);
+        self.open_prices.drain(..start);
+        self.high_prices.drain(..start);
+        self.low_prices.drain(..start);
+        self.close_prices.drain(..start);
+        self.volumes.drain(..start);
+        Ok(())
+    }
+
+    /// Validate once before the sweep, not once per parameter tuple.
+    pub fn validate(&self, level: Level) -> Result<()> {
+        anyhow::ensure!(
+            self.is_rectangular(),
+            "malformed market data: columns disagree in length"
+        );
+        anyhow::ensure!(
+            self.len() >= 2,
+            "not enough candles to backtest: {} (need at least 2)",
+            self.len()
+        );
+        if let Some(gap) = missing_candle_ranges(self.timestamps.iter().copied(), level)?.first() {
+            anyhow::bail!("unresolved {level} candle gap: {}..={} unix-ms; download the missing data before backtesting",
+                gap.start, gap.end.unwrap());
+        }
+        for i in 0..self.len() {
+            let (open, high, low, close) = (
+                self.open_prices[i],
+                self.high_prices[i],
+                self.low_prices[i],
+                self.close_prices[i],
+            );
+            anyhow::ensure!([open, high, low, close].iter().all(|v| v.is_finite() && *v > 0.0)
+                && low <= open.min(close) && high >= open.max(close),
+                "invalid OHLC at candle {i} ({}): open={open}, high={high}, low={low}, close={close}", self.timestamps[i]);
+            let volume = self.volumes[i];
+            anyhow::ensure!(
+                volume.is_nan() || (volume.is_finite() && volume >= 0.0),
+                "invalid volume at candle {i} ({}): {volume}",
+                self.timestamps[i]
+            );
+        }
+        Ok(())
     }
 }
 
@@ -104,7 +156,7 @@ pub struct Bars<'a, T> {
 }
 
 impl<T> Bars<'_, T> {
-    /// Number of candles. All columns are the same length by construction.
+    /// Number of candles. Callers must supply equally sized columns.
     pub fn len(&self) -> usize {
         self.close.len()
     }
@@ -215,7 +267,7 @@ impl DataPaths {
     /// appending to an older file would silently interleave two layouts. Bump
     /// it whenever the column set changes.
     pub fn results(&self, pair: &str, level: &Level) -> PathBuf {
-        self.results_dir.join(format!("{pair}-{level}_v3.csv"))
+        self.results_dir.join(format!("{pair}-{level}_v4.csv"))
     }
 }
 
@@ -312,7 +364,7 @@ mod tests {
         );
         assert_eq!(
             paths.results("BTC-USDT", &Level::Hour4),
-            Path::new("some/results").join("BTC-USDT-4h_v3.csv")
+            Path::new("some/results").join("BTC-USDT-4h_v4.csv")
         );
     }
 }

@@ -15,7 +15,7 @@ cargo run --release -- --strategy rsi_reversion --param period=5..40 --split 0.7
 - Precomputes the strategy's indicators once, across the whole parameter range.
 - Runs one backtest per parameter tuple, in parallel, and keeps the best by
   Sharpe ratio.
-- Prints the winner and appends it to `results/<pair>-<level>_v3.csv`.
+- Prints the winner and appends it to `results/<pair>-<level>_v4.csv`.
 
 Execution model: the signal is read from bar *i*, the fill happens at
 `open[i+1]`, and the position is marked at `close[i+1]`. There is no
@@ -117,9 +117,9 @@ than letting the process die.
 
 - `dataKLines/<pair>-<level>.feather` — cached candles (Apache Arrow IPC).
   A legacy `.json` cache is migrated on first load. Caches written before
-  volume support (five columns) still load, with volume as `NaN`, and backfill
-  on the next download.
-- `results/<pair>-<level>_v3.csv` — appended run history. The version suffix
+  volume support (five columns) still load, with volume as `NaN`. Incremental
+  refreshes replace only fetched rows; use `--force` to rebuild all volumes.
+- `results/<pair>-<level>_v4.csv` — appended run history. The version suffix
   isolates schema changes: the header is only written for an empty file, so a
   new column set has to mean a new filename.
 
@@ -127,6 +127,18 @@ Freshness is measured from the **last candle inside the file**, not the file's
 mtime, and the threshold scales with the timeframe (two bar intervals, floored
 at two minutes) so a 15m backtest cannot silently run on day-old data. When the
 cache is stale, only the missing slice is fetched.
+
+Every refresh also checks for internal gaps, even in a fresh cache. Missing
+intervals are fetched once using the normal HTTP retry policy, merged, and
+checked again. Successfully repaired candles are saved; a backtest with
+unresolved gaps fails with their timestamps. No candles are invented or
+forward-filled. Invalid OHLC values and timestamps also stop the backtest.
+
+An explicit `--since` backfills missing earlier history and selects candles
+opening on or after that date for the backtest, before indicator warmup and
+splitting. Older cached candles are preserved. Without the flag, the whole
+cache is evaluated. Downloads that fail do not fall back to unverified cached
+coverage; a successful request may start at the pair's first available candle.
 
 The download path deliberately **drops the currently forming candle** — Binance
 will happily return it, and writing a half-formed bar into the cache freezes it
@@ -156,7 +168,7 @@ Options:
   --level <INTERVAL>    Candle interval: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 3d 1w 1M (default: 15m)
   --threads <N>         Rayon worker threads; 0 = auto (default: 1)
   --force               Bypass the freshness guard and re-download
-  --since <DATE|MS>     Override download start (YYYY-MM-DD or unix-ms)
+  --since <DATE|MS>     Download and backtest from this date (YYYY-MM-DD or unix-ms)
   --split <FRACTION>    Optimize on the leading FRACTION of candles and
                          report the winner on the held-out remainder
   --data-dir <PATH>     Kline cache directory (default: dataKLines)
@@ -178,17 +190,25 @@ fetch only the delta.
 
 `--split` exists because a Sharpe argmax over ~180k parameter points on a
 single series is an in-sample result by construction. With it, the winner is
-chosen on the leading fraction of the data and re-scored on the held-out tail;
-the tail is the number worth trusting. Indicators are still built over the
+chosen on the leading fraction of the data and re-scored on the held-out tail.
+Repeated tuning against that tail also overfits it. Indicators are built over the
 whole series, so the held-out segment starts with its warmup already behind it.
+
+Requested splits must be strictly between 0 and 1 and leave at least two
+candles on each side; invalid requests fail rather than disable the holdout.
+The v4 CSV records the actual date boundaries, candle count, requested start,
+split fraction/index, capital, fees, risk-free rate and execution model, plus
+all winning strategy settings (including fixed StochRSI settings). Existing
+v3 history is left untouched; the CSV does not archive the underlying candles.
 
 Reported alongside Sharpe: max drawdown, Sortino, Calmar, CAGR, trade count,
 win rate and exposure. Exposure in particular is worth a look — a great Sharpe
 at 2% exposure is a different animal from one at 90%. A position still open at
 the last bar is not counted as a trade.
 
-Sortino is reported as `inf` for a run that never had a losing bar; that is the
-honest value, and it cannot win a sweep because ranking is on Sharpe alone.
+Sortino is `inf` for positive excess return without any bar below its target;
+ranking uses Sharpe alone. Complete capital loss gives CAGR -100%. Annualized
+metrics use nominal bars per year, after requiring uninterrupted candle cadence.
 
 ## Precision
 
@@ -196,6 +216,8 @@ The `f32` (default) and `f64` features select the **storage** precision of the
 indicator cache and the equity path. Indicator arithmetic runs in `f64`
 regardless: it happens once per run, while the sweep reads the stored arrays
 hundreds of thousands of times, so the storage width is what governs cost.
+Raw OHLCV is parsed and cached as f32 in both builds; selecting f64 does not
+recover price precision already lost at ingestion.
 
 ```bash
 cargo run --release                                          # f32
@@ -217,7 +239,7 @@ The two are mutually exclusive; enabling both, or neither, is a compile error.
 | `src/exchange.rs`, `src/download.rs` | Binance client, pagination, caching policy |
 | `src/feather.rs`, `src/data.rs` | Cache format, `CandleSeries`, `Bars`, `DataPaths` |
 | `src/output.rs` | Results CSV |
-| `tests/golden.rs` | Pins the `double_ema` result on the committed fixture |
+| `tests/golden.rs` | Rejects fixture gaps and pins `double_ema` on its contiguous tail |
 
 ## Development
 
@@ -226,11 +248,13 @@ cargo test
 cargo test --no-default-features --features f64
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo run --release --example bench_sweep -- 200 1     # sweep timing
+cargo run --release --example bench_sweep -- 200 1 BTC-USDT 4h 1582128000000
 ```
 
-`tests/golden.rs` is the safety net for engine changes: it pins the winning
-parameters and metrics of `double_ema` on the committed `BTC-USDT-4h` fixture.
+`tests/golden.rs` checks rejection of gaps in the committed `BTC-USDT-4h`
+fixture and pins `double_ema` on its explicitly selected contiguous tail.
+The benchmark command selects that same tail, starting 2020-02-19 16:00 UTC,
+without modifying or downloading the fixture.
 Parameters are asserted exactly; metrics carry a tolerance sized for a change
 of accumulation scheme, not for a change of behaviour. If it fails, something
 about the simulation changed — work out what before re-recording it.

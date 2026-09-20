@@ -3,8 +3,10 @@
 //! The header is written only for an empty or missing target, so a schema
 //! change must also change the file name (see `DataPaths::results`) — otherwise
 //! new rows would silently append under an old header.
+//! The v4 schema includes actual candle-open boundaries, split indices and
+//! execution settings. It records an experiment without archiving its inputs.
 
-use crate::backtest::BacktestMetrics;
+use crate::backtest::{BacktestMetrics, ExecutionModel};
 use chrono::Utc;
 use std::borrow::Cow;
 use std::fs;
@@ -19,6 +21,18 @@ pub struct ResultRow<'a> {
     pub strategy: &'a str,
     pub params: &'a str,
     pub duration_ms: f64,
+    /// Candle-open timestamps delimiting the selected dataset, in UTC unix-ms.
+    pub first_time_ms: u64,
+    pub last_time_ms: u64,
+    pub candles: usize,
+    pub requested_start_ms: Option<u64>,
+    pub split_fraction: Option<f32>,
+    /// Zero-based index of the first candle in the held-out segment.
+    pub split_index: Option<usize>,
+    pub starting_capital: f32,
+    pub fee_rate: f32,
+    pub risk_free_rate: f32,
+    pub execution_model: ExecutionModel,
     /// Metrics over the optimization segment.
     pub metrics: BacktestMetrics,
     /// Metrics on the held-out tail when `--split` was used; empty columns
@@ -45,7 +59,7 @@ fn metric_headers(prefix: &str) -> String {
 
 fn header() -> String {
     format!(
-        "Filename,Date,Precision,Strategy,Params,DurationMs,{},{}",
+        "Filename,Date,Precision,Strategy,Params,DurationMs,FirstTimeMs,LastTimeMs,Candles,RequestedStartMs,SplitFraction,SplitIndex,StartingCapital,FeeRate,RiskFreeRate,ExecutionModel,{},{}",
         metric_headers(""),
         metric_headers("oos_")
     )
@@ -108,13 +122,27 @@ pub fn write_to_file(output_path: &Path, row: &ResultRow<'_>) -> std::io::Result
     let now = Utc::now();
     writeln!(
         writer,
-        "{},{},{},{},{},{:.3},{},{}",
+        "{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_escape(row.ohlcv_file),
         now.to_rfc3339(),
         csv_escape(row.precision),
         csv_escape(row.strategy),
         csv_escape(row.params),
         row.duration_ms,
+        row.first_time_ms,
+        row.last_time_ms,
+        row.candles,
+        row.requested_start_ms
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        row.split_fraction
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        row.split_index.map(|v| v.to_string()).unwrap_or_default(),
+        row.starting_capital,
+        row.fee_rate,
+        row.risk_free_rate,
+        row.execution_model,
         metric_columns(&row.metrics),
         row.out_of_sample
             .as_ref()
@@ -149,6 +177,16 @@ mod tests {
             strategy: "double_ema",
             params,
             duration_ms: 10.0,
+            first_time_ms: 60_000,
+            last_time_ms: 600_000,
+            candles: 10,
+            requested_start_ms: Some(60_000),
+            split_fraction: out_of_sample.map(|_| 0.7),
+            split_index: out_of_sample.map(|_| 7),
+            starting_capital: 1000.0,
+            fee_rate: 0.0015,
+            risk_free_rate: 0.0,
+            execution_model: ExecutionModel::NextOpen,
             metrics: metrics(1234.5, 1.25),
             out_of_sample,
         }
@@ -184,21 +222,38 @@ mod tests {
 
     #[test]
     fn every_row_has_exactly_as_many_columns_as_the_header() {
-        // The blank out-of-sample block is the easy thing to get wrong; a
-        // ragged CSV silently misaligns every column after it.
-        let expected = header().split(',').count();
-        let with_split = format!(
-            "x,x,x,x,x,x,{},{}",
-            metric_columns(&metrics(1.0, 1.0)),
-            metric_columns(&metrics(2.0, 2.0))
-        );
-        let without_split = format!(
-            "x,x,x,x,x,x,{},{}",
-            metric_columns(&metrics(1.0, 1.0)),
-            blank_metric_columns()
-        );
-        assert_eq!(with_split.split(',').count(), expected);
-        assert_eq!(without_split.split(',').count(), expected);
+        let path = std::env::temp_dir().join(format!(
+            "backtest_columns_{}.csv",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_to_file(&path, &row("period=5", None)).unwrap();
+        write_to_file(&path, &row("period=5", Some(metrics(999.0, 0.5)))).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        let names: Vec<_> = lines[0].split(',').collect();
+        for (index, line) in lines[1..].iter().enumerate() {
+            let fields: Vec<_> = line.split(',').collect();
+            assert_eq!(fields.len(), names.len());
+            let field = |name| fields[names.iter().position(|v| *v == name).unwrap()];
+            for (name, expected) in [
+                ("FirstTimeMs", "60000"),
+                ("LastTimeMs", "600000"),
+                ("Candles", "10"),
+                ("RequestedStartMs", "60000"),
+                ("StartingCapital", "1000"),
+                ("FeeRate", "0.0015"),
+                ("RiskFreeRate", "0"),
+                ("ExecutionModel", "next_open"),
+            ] {
+                assert_eq!(field(name), expected);
+            }
+            assert_eq!(field("SplitFraction"), if index == 0 { "" } else { "0.7" });
+            assert_eq!(field("SplitIndex"), if index == 0 { "" } else { "7" });
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

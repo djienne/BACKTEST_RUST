@@ -4,8 +4,8 @@
 //! (`time: UInt64`, `open/high/low/close/volume: Float32`). Files written
 //! before volume support carry the same five leading columns and no sixth;
 //! those still load, with volume set to `NaN`. Anything else is rejected up
-//! front so a malformed cache fails loudly at load time rather than producing
-//! garbage candles.
+//! front. Schema checks do not establish valid prices or uninterrupted time;
+//! the engine validates those before backtesting.
 
 use crate::exchange::{unknown_volume, K};
 use anyhow::{anyhow, Context, Result};
@@ -351,8 +351,7 @@ mod tests {
             assert_eq!(got.high, want.high);
             assert!(got.volume.is_nan(), "absent volume must read as NaN");
         }
-        // The freshness probe has to accept the old layout too, or an upgrade
-        // would look like a corrupt cache and trigger a full re-download.
+        // The timestamp probe used during migration also accepts the old layout.
         assert_eq!(read_last_time(&path).unwrap(), candles.last().unwrap().time);
         let _ = std::fs::remove_file(&path);
     }

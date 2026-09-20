@@ -103,7 +103,7 @@ impl Strategy for BollingerReversion {
         }
     }
 
-    fn param_summary((period, tenths): Self::Params) -> String {
+    fn param_summary((period, tenths): Self::Params, _cfg: &Self::Config) -> String {
         format!("period={period},deviations={:.1}", tenths as f64 / 10.0)
     }
 
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn param_summary_renders_tenths_as_a_decimal() {
         assert_eq!(
-            BollingerReversion::param_summary((20, 25)),
+            BollingerReversion::param_summary((20, 25), &BollingerConfig::default()),
             "period=20,deviations=2.5"
         );
     }

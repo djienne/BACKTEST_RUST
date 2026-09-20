@@ -26,8 +26,10 @@ pub fn rsi(values: &[f64], period: usize) -> Vec<f64> {
     let mut losses = nan_series(len);
     for index in 1..len {
         let change = values[index] - values[index - 1];
-        gains[index] = change.max(0.0);
-        losses[index] = (-change).max(0.0);
+        if change.is_finite() {
+            gains[index] = change.max(0.0);
+            losses[index] = (-change).max(0.0);
+        }
     }
 
     let avg_gain = rma(&gains, period);
@@ -311,6 +313,20 @@ mod tests {
         assert!(rsi(&[1.0, 2.0], 0).iter().all(|v| v.is_nan()));
         assert!(rsi(&[1.0], 14).iter().all(|v| v.is_nan()));
         assert!(rsi(&[], 14).is_empty());
+    }
+
+    #[test]
+    fn rsi_skips_undefined_prefix_without_inventing_zero_changes() {
+        let prices = [100.0, 90.0, 100.0, 90.0, 100.0, 110.0];
+        let expected = rsi(&prices, 3);
+        let mut prefixed = vec![f64::NAN; 2];
+        prefixed.extend(prices);
+        let actual = rsi(&prefixed, 3);
+        assert!(actual[..5].iter().all(|v| v.is_nan()));
+        for i in 3..prices.len() {
+            assert_eq!(actual[i + 2], expected[i]);
+        }
+        assert!((actual[5] - 100.0 / 3.0).abs() < 1e-12);
     }
 
     #[test]

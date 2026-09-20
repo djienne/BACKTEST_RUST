@@ -1,10 +1,8 @@
-//! Golden regression: pins the `double_ema` sweep result on the committed
-//! `dataKLines/BTC-USDT-4h.feather` fixture.
+//! Regression over the explicitly selected uninterrupted tail of the fixture.
 //!
-//! This is the safety net for engine refactors. The winning parameters must
-//! never change; the metrics may drift in the last digits when the reduction
-//! order or accumulation scheme changes (e.g. two-pass variance → Welford), so
-//! they are compared with a precision-dependent tolerance rather than exactly.
+//! The full fixture has known gaps and must be rejected. Recorded values here
+//! detect behavioral changes; hand-computed accounting tests provide the
+//! independent check on the simulation, rather than treating old output as truth.
 
 use backtest_rust::backtest::{run, EngineConfig, ExecutionModel};
 use backtest_rust::data::{load_data_file, DataPaths};
@@ -12,14 +10,13 @@ use backtest_rust::exchange::Level;
 use backtest_rust::strategy::double_ema::{DoubleEmaConfig, DoubleEmaCrossover};
 use std::borrow::Cow;
 
-/// Recorded from the pre-refactor engine (commit 7f305e7), `f64` build. See the
-/// module docs before touching. The `f32` build agrees on the parameters and
-/// lands within the tolerances below:
-///   f32: final=23468.886719 sharpe=1.235991836 max_dd=53.727335
-///   f64: final=23468.932676 sharpe=1.235911914 max_dd=53.727312
-const EXPECTED_PARAMS: (usize, usize) = (39, 59);
-const EXPECTED_FINAL_VALUE: f64 = 23_468.932_676;
-const EXPECTED_SHARPE: f64 = 1.235_911_914;
+/// The selected tail starts immediately after the last known gap.
+const FIRST_CONTIGUOUS_TIMESTAMP: u64 = 1_582_128_000_000;
+// f64: final=9500.632369, sharpe=1.100367925, max_dd=53.727312.
+// f32: final=9500.611328, sharpe=1.100367042, max_dd=53.727324.
+const EXPECTED_PARAMS: (usize, usize) = (40, 58);
+const EXPECTED_FINAL_VALUE: f64 = 9_500.632_369;
+const EXPECTED_SHARPE: f64 = 1.100_367_925;
 const EXPECTED_MAX_DD: f64 = 53.727_312;
 const EXPECTED_CANDLES: usize = 15_982;
 
@@ -49,8 +46,14 @@ fn strategy() -> DoubleEmaConfig {
 
 #[test]
 fn double_ema_sweep_matches_the_recorded_baseline() {
-    let market = load_data_file(&DataPaths::default(), "BTC-USDT", &Level::Hour4)
+    let mut market = load_data_file(&DataPaths::default(), "BTC-USDT", &Level::Hour4)
         .expect("fixture data should load");
+    assert_eq!(market.len(), EXPECTED_CANDLES);
+    let error = run::<DoubleEmaCrossover>(&engine(), &strategy(), &market).unwrap_err();
+    assert!(format!("{error:#}").contains("gap"));
+    market.retain_since(FIRST_CONTIGUOUS_TIMESTAMP).unwrap();
+    assert_eq!(market.timestamps[0], FIRST_CONTIGUOUS_TIMESTAMP);
+    assert_eq!(market.len(), 13_499);
     let selected = run::<DoubleEmaCrossover>(&engine(), &strategy(), &market).unwrap();
     let m = selected.best.metrics;
 
@@ -63,11 +66,6 @@ fn double_ema_sweep_matches_the_recorded_baseline() {
         market.close_prices.len(),
     );
 
-    assert_eq!(
-        market.close_prices.len(),
-        EXPECTED_CANDLES,
-        "fixture changed size — re-record the baseline deliberately, don't relax it"
-    );
     assert_eq!(selected.best.params, EXPECTED_PARAMS, "winning parameters");
     // Relative 1e-4 on the equity: a genuinely different trade sequence moves
     // this by percent, not by parts-per-ten-thousand.

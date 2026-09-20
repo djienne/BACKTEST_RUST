@@ -1,11 +1,11 @@
 //! Repeatable sweep timing, for before/after comparisons of engine changes.
 //!
-//! Reads a cached market straight off disk — never downloads — so the input is
-//! identical between runs. Reports wall-clock sweep time and throughput.
+//! Reads a cached market without downloading. Gaps are rejected; an optional
+//! final argument selects a start in unix-ms. Reports sweep time and throughput.
 //!
 //! ```text
-//! cargo run --release --example bench_sweep                  # defaults
-//! cargo run --release --example bench_sweep -- 200 4         # max period, threads
+//! # Committed fixture's contiguous tail; max period, threads, pair, level, since:
+//! cargo run --release --example bench_sweep -- 200 4 BTC-USDT 4h 1582128000000
 //! cargo run --release --example bench_sweep -- 200 4 ETH-USDT 1h
 //! ```
 
@@ -31,7 +31,10 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let paths = DataPaths::default();
-    let market = load_data_file(&paths, &pair, &level)?;
+    let mut market = load_data_file(&paths, &pair, &level)?;
+    if let Some(since) = args.get(4) {
+        market.retain_since(since.parse()?)?;
+    }
 
     let engine = EngineConfig {
         pair: Cow::Owned(pair.clone()),

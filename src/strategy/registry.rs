@@ -52,7 +52,7 @@ fn dispatch<S: ConfigurableStrategy>(
     let outcome = run::<S>(engine, &config, market)?;
     Ok(StrategyReport {
         name: S::NAME,
-        params: S::param_summary(outcome.best.params),
+        params: S::param_summary(outcome.best.params, &config),
         metrics: outcome.best.metrics,
         out_of_sample: outcome.out_of_sample,
         precision: outcome.precision,

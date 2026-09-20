@@ -26,6 +26,9 @@
 //! position is marked at `close[i + 1]`. There is no look-ahead. Fees are
 //! charged on both sides; there is no slippage or minimum-notional model.
 //! Positions are long or flat — no shorting, no leverage, no stop-losses.
+//! The engine rejects invalid prices and gaps. The CLI first attempts to fetch
+//! missing candles, applies an explicit `--since` to the in-memory window, then
+//! runs the sweep. Requested holdouts are never silently disabled.
 //!
 //! # Precision
 //!

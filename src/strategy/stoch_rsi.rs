@@ -98,8 +98,8 @@ impl Strategy for StochRsi {
         }
     }
 
-    fn param_summary((period, oversold, overbought): Self::Params) -> String {
-        format!("stoch_period={period},oversold={oversold},overbought={overbought}")
+    fn param_summary((period, oversold, overbought): Self::Params, cfg: &Self::Config) -> String {
+        format!("stoch_period={period},oversold={oversold},overbought={overbought},rsi_period={},k_smooth={},d_smooth={}", cfg.rsi_period, cfg.k_smooth, cfg.d_smooth)
     }
 
     fn tie_break(left: Self::Params, right: Self::Params) -> Ordering {
@@ -138,6 +138,20 @@ impl ConfigurableStrategy for StochRsi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_includes_fixed_settings() {
+        let cfg = StochRsiConfig {
+            rsi_period: 7,
+            k_smooth: 1,
+            d_smooth: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            StochRsi::param_summary((14, 20, 80), &cfg),
+            "stoch_period=14,oversold=20,overbought=80,rsi_period=7,k_smooth=1,d_smooth=2"
+        );
+    }
     use crate::data::OwnedBars;
 
     #[test]

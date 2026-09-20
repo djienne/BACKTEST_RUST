@@ -101,7 +101,7 @@ impl Strategy for MacdCross {
         }
     }
 
-    fn param_summary((_, fast, slow, signal): Self::Params) -> String {
+    fn param_summary((_, fast, slow, signal): Self::Params, _cfg: &Self::Config) -> String {
         format!("fast={fast},slow={slow},signal={signal}")
     }
 

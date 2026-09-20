@@ -79,8 +79,9 @@ pub trait Strategy {
         params: Self::Params,
     ) -> impl Fn(usize) -> Signal + 'a;
 
-    /// Human-readable serialization for CSV/println.
-    fn param_summary(params: Self::Params) -> String;
+    /// Winning parameters and fixed settings for CSV/println. The resolved
+    /// config supplies settings that are not part of the swept tuple.
+    fn param_summary(params: Self::Params, cfg: &Self::Config) -> String;
 
     /// Tie-break used by the sweep when sharpe + final_value are equal.
     /// Returning `Less` means `left` wins; `Greater` means `right` wins;
